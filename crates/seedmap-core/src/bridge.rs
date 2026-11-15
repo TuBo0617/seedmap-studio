@@ -1,99 +1,22 @@
+//! FFI surface of the C engine.
+//!
+//! `build.rs` compiles cubiomes and the bridges into a static archive, so the
+//! symbols below are linked into the binary on every platform. Upstream ships
+//! the engine as a DLL on Windows and loads it at runtime; a standalone app has
+//! no reason to do that, and static linking keeps the ABI check in one place.
+
 use super::BridgeFeature;
 use std::ffi::c_char;
 
-#[cfg(windows)]
-use std::sync::OnceLock;
-
-#[cfg(windows)]
-static ENGINE: OnceLock<libloading::Library> = OnceLock::new();
-
+/// The engine is part of the executable, so it is always available.
 pub(super) fn ensure_available() -> std::io::Result<()> {
-    #[cfg(windows)]
-    if ENGINE.get().is_none() {
-        let executable = std::env::current_exe()?;
-        let parent = executable.parent().ok_or_else(|| {
-            std::io::Error::other("Cannot locate the seed map engine")
-        })?;
-        let mut paths =
-            vec![parent.join("resources/seed-map/axolotl-cubiomes.dll")];
-        #[cfg(debug_assertions)]
-        paths
-            .push(std::path::PathBuf::from(env!("AXOLOTL_CUBIOMES_BUILD_DLL")));
-        let mut failures = Vec::new();
-        for path in paths {
-            let result = unsafe { libloading::Library::new(&path) }.and_then(
-                |library| {
-                    unsafe {
-                        let version: libloading::Symbol<
-                            unsafe extern "C" fn() -> u32,
-                        > = library.get(b"axolotl_seed_map_abi_version\0")?;
-                        let revision: libloading::Symbol<
-                            unsafe extern "C" fn() -> u64,
-                        > = library
-                            .get(b"axolotl_seed_map_engine_revision\0")?;
-                        if version() != 2 || revision() != 0xa49d5bc5b709e6e2 {
-                            return Err(libloading::Error::IncompatibleSize);
-                        }
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_java_version\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_render\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_find_features\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_get_spawn\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_biome_at\0")?;
-
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_scan_ores\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_capability\0")?;
-                        let _: libloading::Symbol<*const ()> = library
-                            .get(b"axolotl_seed_map_structure_details\0")?;
-                        let _: libloading::Symbol<*const ()> = library
-                            .get(b"axolotl_seed_map_ancient_city_layout\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_generate_loot\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_free_result\0")?;
-                        let _: libloading::Symbol<*const ()> =
-                            library.get(b"axolotl_seed_map_underground\0")?;
-                        let _: libloading::Symbol<*const ()> = library
-                            .get(b"axolotl_seed_map_scan_ores_cancellable\0")?;
-                        let _: libloading::Symbol<*const ()> = library
-                            .get(b"axolotl_seed_map_underground_chunk\0")?;
-                    }
-                    Ok(library)
-                },
-            );
-            match result {
-                Ok(library) => {
-                    let _ = ENGINE.set(library);
-                    return Ok(());
-                }
-                Err(error) => {
-                    failures.push(format!("{}: {error}", path.display()))
-                }
-            }
-        }
-        return Err(std::io::Error::other(format!(
-            "The seed map engine could not be loaded. Repair the launcher installation and retry. {}",
-            failures.join("; ")
-        )));
-    }
     Ok(())
 }
 
 macro_rules! engine_function {
     ($name:ident($($argument:ident: $ty:ty),* $(,)?) -> $result:ty, $failure:expr) => {
-        #[cfg(not(windows))]
-        unsafe extern "C" { pub(super) fn $name($($argument: $ty),*) -> $result; }
-        #[cfg(windows)]
-        pub(super) unsafe fn $name($($argument: $ty),*) -> $result {
-            let Some(library) = ENGINE.get() else { return $failure; };
-            let function = unsafe { library.get::<unsafe extern "C" fn($($ty),*) -> $result>(concat!(stringify!($name), "\0").as_bytes()) };
-            match function { Ok(function) => unsafe { function($($argument),*) }, Err(_) => $failure }
+        unsafe extern "C" {
+            pub(super) fn $name($($argument: $ty),*) -> $result;
         }
     };
 }

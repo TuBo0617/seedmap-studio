@@ -278,7 +278,7 @@ STRUCT(LootFunction) {
 // ----------------------------------------------------------------------------------------
 // Roll count choice functions
 
-static inline int roll_count_constant(RandomSource*, const int min, int unused_)
+static inline int roll_count_constant(RandomSource *unused_rnd, const int min, int unused_)
 {
     (void)(unused_); // Unused
     return min;

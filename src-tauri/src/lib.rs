@@ -66,7 +66,19 @@ async fn seedmap_biome_at(
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // macOS keeps the standard app/edit menu so that Cmd+Q, Cmd+C and Cmd+V
+    // work inside the webview; other platforms use the plain window instead of
+    // a menu bar.
+    #[cfg(target_os = "macos")]
+    let builder = builder.setup(|app| {
+        let menu = tauri::menu::Menu::default(app.handle())?;
+        app.set_menu(menu)?;
+        Ok(())
+    });
+
+    builder
         .invoke_handler(tauri::generate_handler![
             seedmap_profiles,
             seedmap_render_tile,

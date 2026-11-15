@@ -30,22 +30,71 @@
     └── lib/features.ts         # 结构名称与配色
 ```
 
+## 平台支持
+
+与原 Axolotl 启动器一致，覆盖 6 个目标：
+
+| 平台 | 目标三元组 | 产物 | C 编译器 |
+|---|---|---|---|
+| Windows x64 | `x86_64-pc-windows-msvc` | `.msi` / `-setup.exe` | `clang-cl`（回退 `cl.exe`） |
+| Windows arm64 | `aarch64-pc-windows-msvc` | `-setup.exe` | `clang-cl` |
+| Windows x64（MinGW） | `x86_64-pc-windows-gnu` | `.exe` | `x86_64-w64-mingw32-gcc` |
+| macOS arm64 | `aarch64-apple-darwin` | `.dmg` | Apple clang |
+| macOS x64 | `x86_64-apple-darwin` | `.dmg` | Apple clang |
+| Linux x64 / arm64 | `*-unknown-linux-gnu` | `.deb` / `.rpm` / `.AppImage` | gcc / clang |
+
+CI（`.github/workflows/build.yml`）按这张表跑矩阵，标签 push 时产出全部安装包。
+
+已在 Linux 上一路验证到产物：`deb`、`rpm`、Windows x64 交叉编译的 `exe` 都可正常启动；
+macOS 的 `dmg` 必须有 macOS 主机（Apple SDK 不能交叉），Windows arm64 同理，交给 CI。
+
+**为什么 Windows 上默认用 clang-cl**：cubiomes 用了 C99 变长数组（VLA，6 个文件 15 处），
+`cl.exe` 不支持；`clang-cl` 命令行与 MSVC 完全兼容，但接受这些 GNU 扩展。`build.rs`
+会自动检测 `clang-cl`，找不到就退回 `cl.exe`（届时会因 VLA 编译失败）。不想装 LLVM 的话，
+也可以用 MinGW 目标 `x86_64-pc-windows-gnu`，GCC 直接支持 VLA。
+
 ## 构建与运行
 
 ```bash
 pnpm install
-pnpm build                     # 产出 dist/
-
-cd src-tauri
-cargo build                    # 首次会编译 cubiomes 与 Tauri 依赖
-./target/debug/seedmap-studio
+pnpm build                     # 前端 → dist/
+pnpm tauri build               # 本机安装包（src-tauri/target/release/bundle/）
 ```
 
-需要系统里有 GTK3 / WebKitGTK 4.1（Linux）。Ubuntu 上：
+只想跑起来看效果：
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1
+pnpm build && cd src-tauri && cargo build && ./target/debug/seedmap-studio
 ```
+
+### 各平台依赖
+
+**Linux（Debian/Ubuntu）**
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+                 libayatana-appindicator3-dev librsvg2-dev patchelf
+```
+
+**Windows**：装 [WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/)（Win11 自带）
+和 [LLVM](https://llvm.org/)（提供 `clang-cl`），或者直接用 MinGW 工具链。
+
+**macOS**：装 Xcode Command Line Tools（`xcode-select --install`）。
+
+### 交叉编译 Windows
+
+Linux 上可以产出 Windows x64 可执行文件：
+
+```bash
+sudo apt install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+pnpm build
+cd src-tauri && cargo build --release --target x86_64-pc-windows-gnu
+```
+
+产物在 `src-tauri/target/x86_64-pc-windows-gnu/release/seedmap-studio.exe`，
+运行需要同目录下有 WebView2 运行时（系统级安装即可，`downloadBootstrapper` 安装包会自动装）。
+
 
 ## 已实现
 
