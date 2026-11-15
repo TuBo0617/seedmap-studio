@@ -1,9 +1,14 @@
 # Seedmap Studio
 
+[![build](https://github.com/TuBo0617/seedmap-studio/actions/workflows/build.yml/badge.svg)](https://github.com/TuBo0617/seedmap-studio/actions/workflows/build.yml)
+[![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+
 把 Axolotl Launcher 里的「种子地图」实验室工具拆出来单独做的一个桌面应用：
 输入种子，按 Minecraft 版本和维度实时生成地形图，并标出村庄、要塞、远古城市等结构。
 
 界面用 Vue 3 + TypeScript，桌面壳是 Tauri 2，地形由 Rust 调用 cubiomes（C）生成。
+
+安装包见 [Releases](https://github.com/TuBo0617/seedmap-studio/releases)。
 
 ## 目录结构
 
