@@ -103,6 +103,10 @@ jobs:
   android:
     name: android-universal
     runs-on: ubuntu-24.04
+    env:
+      # Four ABIs are compiled in one Gradle invocation; cap cargo's own
+      # parallelism so the runner does not run out of memory.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
 
