@@ -6,12 +6,19 @@ name: build
 # unsigned iOS build (signing needs an Apple developer certificate).
 on:
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Which jobs to run"
+        type: choice
+        options: [all, ios, android, desktop]
+        default: all
   push:
     tags: ["v*"]
 
 jobs:
   build:
     name: ${{ matrix.artifact }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || inputs.jobs == 'desktop' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -102,6 +109,7 @@ jobs:
 
   android:
     name: android-universal
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || inputs.jobs == 'android' }}
     runs-on: ubuntu-24.04
     env:
       # Four ABIs are compiled in one Gradle invocation; cap cargo's own
@@ -165,6 +173,7 @@ jobs:
 
   ios:
     name: ios-unsigned
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || inputs.jobs == 'ios' }}
     runs-on: macos-26
     env:
       # No signing certificate exists on CI; the CLI only needs a non-empty
@@ -210,7 +219,7 @@ jobs:
       # unsigned and packed into an .ipa that can be re-signed locally with
       # AltStore, Sideloadly or `codesign`.
       - name: Build unsigned app
-        run: pnpm tauri ios build --target aarch64-apple-ios --release --no-sign
+        run: pnpm tauri ios build --target aarch64-apple-ios --no-sign
 
       - name: Collect unsigned ipa
         run: |
