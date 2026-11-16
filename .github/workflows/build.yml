@@ -62,7 +62,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          workspaces: "src-tauri -> target"
 
       - name: Install Linux dependencies
         if: startsWith(matrix.os, 'ubuntu')
@@ -126,7 +126,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          workspaces: "src-tauri -> target"
           key: android
 
       - uses: actions/setup-java@v4
@@ -134,11 +134,15 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - uses: android-actions/setup-android@v3
-
+      # The runner image ships the SDK, but `android-actions/setup-android`
+      # is not used here: it still asks sdkmanager for the retired "tools"
+      # package and aborts. The preinstalled cmdline-tools are enough.
       - name: Install NDK and platform
         run: |
-          sdkmanager --install "ndk;27.2.12479018" "platforms;android-36" "build-tools;36.0.0"
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMGR" ] || SDKMGR="$(command -v sdkmanager)"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install "ndk;27.2.12479018" "platforms;android-36" "build-tools;36.0.0"
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install frontend dependencies
@@ -162,6 +166,11 @@ jobs:
   ios:
     name: ios-unsigned
     runs-on: macos-26
+    env:
+      # No signing certificate exists on CI; the CLI only needs a non-empty
+      # team id to generate the Xcode project. The build itself runs with
+      # `--no-sign`, so this value never reaches a provisioning profile.
+      APPLE_DEVELOPMENT_TEAM: ABCDE12345
     steps:
       - uses: actions/checkout@v4
 
@@ -180,7 +189,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          workspaces: "src-tauri -> target"
           key: ios
 
       - name: Install frontend dependencies
