@@ -603,6 +603,24 @@ size_t axolotl_seed_map_find_features(
         initBlendedNoise(&nether_terrain, seed, DIM_NETHER);
 
     size_t count = 0;
+    /* Villages outnumber every other type by an order of magnitude, so a
+       shared first-come-first-served budget lets them eat the whole result
+       array on a zoomed-out map. Split the budget evenly across the types
+       that are actually requested instead. */
+    size_t requested_kinds = 0;
+    for (size_t index = 0; index < sizeof(AXOLOTL_STRUCTURES) / sizeof(AXOLOTL_STRUCTURES[0]); index++) {
+        const AxolotlStructureDefinition definition = AXOLOTL_STRUCTURES[index];
+        if (!(feature_mask & definition.flag)) continue;
+        StructureConfig config;
+        if (!getStructureConfig(definition.type, minecraft_version, &config)) continue;
+        if (config.dim != dimension || config.regionSize <= 0) continue;
+        requested_kinds++;
+    }
+    if (dimension == DIM_OVERWORLD && (feature_mask & AXOLOTL_FEATURE_STRONGHOLD)) requested_kinds++;
+    if (dimension == DIM_OVERWORLD && (feature_mask & AXOLOTL_FEATURE_SLIME_CHUNK)) requested_kinds++;
+    size_t kind_quota = requested_kinds ? out_len / requested_kinds : out_len;
+    if (kind_quota < 64) kind_quota = 64;
+
     for (size_t index = 0; index < sizeof(AXOLOTL_STRUCTURES) / sizeof(AXOLOTL_STRUCTURES[0]); index++) {
         const AxolotlStructureDefinition definition = AXOLOTL_STRUCTURES[index];
         if (!(feature_mask & definition.flag)) continue;
@@ -610,6 +628,7 @@ size_t axolotl_seed_map_find_features(
         StructureConfig config;
         if (!getStructureConfig(definition.type, minecraft_version, &config)) continue;
         if (config.dim != dimension || config.regionSize <= 0) continue;
+        const size_t kind_start = count;
 
         const int region_span = config.regionSize * 16;
         const int min_region_x = min_x >= 0 ? min_x / region_span : (min_x - region_span + 1) / region_span;
@@ -647,7 +666,9 @@ size_t axolotl_seed_map_find_features(
                 if (!add_feature(
                         out, out_len, &count, position.x, position.z,
                         definition.flag, 0, end_ship)) return count;
+                if (count - kind_start >= kind_quota) break;
             }
+            if (count - kind_start >= kind_quota) break;
         }
     }
 
@@ -669,13 +690,16 @@ size_t axolotl_seed_map_find_features(
         const int min_chunk_z = min_z >= 0 ? min_z / 16 : (min_z - 15) / 16;
         const int max_chunk_x = max_x >= 0 ? max_x / 16 : (max_x - 15) / 16;
         const int max_chunk_z = max_z >= 0 ? max_z / 16 : (max_z - 15) / 16;
+        const size_t slime_start = count;
         for (int chunk_x = min_chunk_x; chunk_x <= max_chunk_x; chunk_x++) {
             for (int chunk_z = min_chunk_z; chunk_z <= max_chunk_z; chunk_z++) {
                 if (!isSlimeChunk(seed, chunk_x, chunk_z)) continue;
                 if (!add_feature(
                         out, out_len, &count, chunk_x * 16 + 8, chunk_z * 16 + 8,
                         AXOLOTL_FEATURE_SLIME_CHUNK, 0, -1)) return count;
+                if (count - slime_start >= kind_quota) break;
             }
+            if (count - slime_start >= kind_quota) break;
         }
     }
 

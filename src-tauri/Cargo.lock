@@ -473,7 +473,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2673,7 +2673,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seedmap-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "flate2",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "seedmap-studio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "seedmap-core",
  "serde",

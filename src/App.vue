@@ -2,16 +2,36 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   biomeAt,
+  cancelOreScan,
   fetchProfiles,
   findFeatures,
   findSpawn,
+  readLevelDat,
   renderTile,
+  scanOres,
   type Dimension,
+  type Edition,
   type MapFeature,
+  type OreHit,
+  type OreKind,
   type VersionProfile,
 } from './lib/api'
 import { DEFAULT_KINDS, FEATURE_BITS, featureMeta, LEGEND_ORDER } from './lib/features'
 import { biomeName } from './lib/biomes'
+import { defaultOres, oreMeta, oresForDimension } from './lib/ores'
+import {
+  clearHistory,
+  loadHistory,
+  recordHistory,
+  removeHistory,
+  type HistoryEntry,
+} from './lib/history'
+import AnalysisPanel from './components/AnalysisPanel.vue'
+import BiomePanel from './components/BiomePanel.vue'
+import HistoryPanel from './components/HistoryPanel.vue'
+import OrePanel from './components/OrePanel.vue'
+import StructurePanel from './components/StructurePanel.vue'
+import UndergroundPanel from './components/UndergroundPanel.vue'
 
 const seedInput = ref('10292992')
 const seedValue = ref('10292992')
@@ -39,6 +59,24 @@ const showLegend = ref(true)
 const dragging = ref(false)
 const dragOffset = reactive({ x: 0, z: 0 })
 const hover = reactive({ x: 0, z: 0 })
+
+// --- 扩展图层：群系高亮 / 矿石 / 地下剖面 / 结构详情 / 历史 ---------------
+
+type SidePanel = 'biomes' | 'ores' | 'analysis' | 'history' | 'underground'
+
+const sidePanel = ref<SidePanel | null>(null)
+const highlightBiomes = ref<number[]>([])
+const activeOres = ref<OreKind[]>([])
+const oreHits = ref<OreHit[]>([])
+const oreScanning = ref(false)
+const oreStatus = ref('')
+const selected = ref<MapFeature | null>(null)
+const history = ref<HistoryEntry[]>([])
+const dropActive = ref(false)
+const importNote = ref<string | null>(null)
+
+let oreSeq = 0
+let oreRequestId: number | null = null
 
 // --- mobile / touch state -------------------------------------------------
 
@@ -115,6 +153,15 @@ const dimensionIndex = computed(() =>
   dimension.value === 'overworld' ? 0 : dimension.value === 'nether' ? 1 : 2,
 )
 
+const oresSupported = computed(
+  () => currentProfile.value?.ores === true && dimension.value !== 'end',
+)
+
+const undergroundSupported = computed(() => {
+  const masks = currentProfile.value?.undergroundMasks
+  return ((masks?.[dimensionIndex.value] ?? 0) & 7) !== 0
+})
+
 const allowedMask = computed(() => {
   const masks = currentProfile.value?.featureMasks
   return masks?.[dimensionIndex.value] ?? 0x3ffffff
@@ -154,6 +201,255 @@ function selectAllKinds(on: boolean) {
   void loadFeatures(renderSeq)
 }
 
+function openSide(next: SidePanel) {
+  sidePanel.value = sidePanel.value === next ? null : next
+  selected.value = null
+  if (next === 'ores' && !activeOres.value.length) {
+    activeOres.value = [...defaultOres(dimension.value)]
+  }
+}
+
+function onBiomesChanged(list: number[]) {
+  highlightBiomes.value = list
+  void repaint()
+}
+
+const viewBounds = computed(() => {
+  const halfW = (viewport.w / 2) * scale.value
+  const halfH = (viewport.h / 2) * scale.value
+  return {
+    minX: Math.round(center.x - halfW),
+    minZ: Math.round(center.z - halfH),
+    maxX: Math.round(center.x + halfW),
+    maxZ: Math.round(center.z + halfH),
+  }
+})
+
+/** 引擎单次最多收 96 个区块，所以按批扫描；12 区块半径 = 25×25 区块（400×400 格）。 */
+const ORE_SCAN_RADIUS = 12
+/** 画布上一次最多画这么多点，再多只会糊成一片，也拖慢重绘。 */
+const ORE_DISPLAY_LIMIT = 8000
+const ORE_BATCH = 96
+
+async function scanViewportOres() {
+  if (!oresSupported.value || oreScanning.value || !activeOres.value.length) return
+  if (scale.value > 4) {
+    oreStatus.value = '先放大到 1:4 或 1:1 再扫描，缩略图上的矿石点没有意义。'
+    return
+  }
+  const seq = ++oreSeq
+  oreScanning.value = true
+  oreStatus.value = '扫描中…'
+  oreHits.value = []
+  drawMarkers()
+
+  const originCx = Math.round(center.x / 16)
+  const originCz = Math.round(center.z / 16)
+  const radius = scale.value <= 1 ? 6 : ORE_SCAN_RADIUS
+  const flat: number[] = []
+  for (let dz = -radius; dz <= radius; dz += 1) {
+    for (let dx = -radius; dx <= radius; dx += 1) {
+      flat.push(originCx + dx, originCz + dz)
+    }
+  }
+  const batches: number[][] = []
+  for (let index = 0; index < flat.length; index += ORE_BATCH * 2) {
+    batches.push(flat.slice(index, index + ORE_BATCH * 2))
+  }
+
+  const requestId = Math.floor(Math.random() * 1_000_000_000) + 1
+  oreRequestId = requestId
+  const hits: OreHit[] = []
+  let truncated = false
+  try {
+    for (const [index, batch] of batches.entries()) {
+      if (seq !== oreSeq) return
+      const results = await scanOres(
+        {
+          seed: seedValue.value,
+          edition: 'java',
+          version: version.value,
+          dimension: dimension.value,
+          ores: activeOres.value,
+          chunks: batch,
+        },
+        requestId,
+      )
+      if (seq !== oreSeq) return
+      for (const chunk of results) {
+        hits.push(...chunk.hits)
+        truncated ||= chunk.truncated
+      }
+      oreHits.value = hits.slice()
+      const percent = Math.round(((index + 1) / batches.length) * 100)
+      oreStatus.value = `扫描中 ${percent}% · ${hits.length} 处`
+      drawMarkers()
+      if (hits.length >= ORE_DISPLAY_LIMIT) {
+        truncated = true
+        break
+      }
+    }
+    oreStatus.value = `${hits.length} 处候选 · ${flat.length / 2} 个区块${
+      truncated ? ' · 已达结果上限' : ''
+    }`
+  } catch (reason) {
+    if (seq === oreSeq) oreStatus.value = String(reason)
+  } finally {
+    if (seq === oreSeq) {
+      oreScanning.value = false
+      oreRequestId = null
+    }
+  }
+}
+
+function setOres(value: OreKind[]) {
+  activeOres.value = value
+  clearOres()
+}
+
+function clearOres() {
+  oreSeq += 1
+  if (oreRequestId !== null) {
+    void cancelOreScan(oreRequestId).catch(() => {})
+    oreRequestId = null
+  }
+  oreScanning.value = false
+  oreHits.value = []
+  oreStatus.value = ''
+  drawMarkers()
+}
+
+function pickFeature(clientX: number, clientY: number) {
+  const canvas = canvasRef.value
+  if (!canvas) return false
+  const rect = canvas.getBoundingClientRect()
+  const mx = clientX - rect.left
+  const my = clientY - rect.top
+  let best: MapFeature | null = null
+  let bestDistance = 14
+  for (const feature of features.value) {
+    if (!activeKinds.value.has(feature.kind)) continue
+    const px = (feature.x - origin.x) / origin.scale
+    const pz = (feature.z - origin.z) / origin.scale
+    const distance = Math.hypot(px - mx, pz - my)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = feature
+    }
+  }
+  if (!best) return false
+  selected.value = best
+  sidePanel.value = null
+  drawMarkers()
+  return true
+}
+
+function closestVersion(candidate: string | null | undefined): string | null {
+  if (!candidate) return null
+  const list = versions.value
+  if (!list.length) return null
+  if (list.includes(candidate)) return candidate
+  const [major, minor] = candidate.split('.').map(Number)
+  const exact = list.find((item) => item.startsWith(`${major}.${minor}.`))
+  if (exact) return exact
+  return list.find((item) => item.startsWith(`${major}.${minor}`)) ?? null
+}
+
+async function importWorld(path: string) {
+  importNote.value = '正在读取存档…'
+  try {
+    const info = await readLevelDat(path)
+    seedInput.value = info.seed
+    seedValue.value = info.seed
+    const matched = closestVersion(info.version)
+    if (matched) version.value = matched
+    sidePanel.value = null
+    selected.value = null
+    clearOres()
+    await jumpToSpawn()
+    importNote.value = `已导入种子 ${info.seed}${
+      info.version ? ` · ${info.version}${matched && matched !== info.version ? ` → ${matched}` : ''}` : ''
+    }`
+    setTimeout(() => {
+      if (importNote.value?.startsWith('已导入')) importNote.value = null
+    }, 6000)
+  } catch (reason) {
+    importNote.value = `导入失败：${String(reason)}`
+  }
+}
+
+function pickHistory(entry: HistoryEntry) {
+  seedInput.value = entry.seed
+  seedValue.value = entry.seed
+  version.value = entry.version
+  dimension.value = entry.dimension
+  sidePanel.value = null
+  clearOres()
+  rememberSeed()
+  void jumpToSpawn()
+}
+
+function forgetHistory(entry: HistoryEntry) {
+  history.value = removeHistory(entry.seed, entry.version)
+}
+
+function wipeHistory() {
+  history.value = clearHistory()
+}
+
+function rememberSeed() {
+  history.value = recordHistory({
+    seed: seedValue.value,
+    version: version.value,
+    dimension: dimension.value,
+    at: Date.now(),
+  })
+}
+
+// --- 工作区记忆 ----------------------------------------------------------
+
+const WORKSPACE_KEY = 'seedmap.workspace.v1'
+
+interface Workspace {
+  seed: string
+  version: string
+  dimension: Dimension
+  scale: number
+  x: number
+  z: number
+}
+
+function saveWorkspace() {
+  try {
+    const data: Workspace = {
+      seed: seedValue.value,
+      version: version.value,
+      dimension: dimension.value,
+      scale: scale.value,
+      x: center.x,
+      z: center.z,
+    }
+    localStorage.setItem(WORKSPACE_KEY, JSON.stringify(data))
+  } catch {
+    // Storage may be unavailable; the map still works without persistence.
+  }
+}
+
+function loadWorkspace(): Workspace | null {
+  try {
+    const raw = localStorage.getItem(WORKSPACE_KEY)
+    if (!raw) return null
+    const data = JSON.parse(raw) as Workspace
+    if (typeof data?.seed !== 'string' || typeof data?.version !== 'string') return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+watch([seedValue, version, dimension, scale], saveWorkspace)
+watch(() => [center.x, center.z], saveWorkspace)
+
 watch(version, () => {
   if (!dimensions.value.includes(dimension.value)) {
     dimension.value = 'overworld'
@@ -162,6 +458,10 @@ watch(version, () => {
 })
 
 watch(dimension, () => {
+  const allowed = new Set(oresForDimension(dimension.value).map((ore) => ore.kind))
+  activeOres.value = activeOres.value.filter((kind) => allowed.has(kind))
+  if (!activeOres.value.length) activeOres.value = [...defaultOres(dimension.value)]
+  clearOres()
   void repaint()
 })
 
@@ -236,7 +536,7 @@ async function repaint() {
           elevation: 128,
           terrain: false,
           contours: false,
-          highlightBiomes: null,
+          highlightBiomes: highlightBiomes.value.length ? highlightBiomes.value : null,
         })
           .then((buffer) => {
             if (seq !== renderSeq) return
@@ -290,7 +590,13 @@ function drawMarkers() {
   if (!ctx) return
   ctx.clearRect(0, 0, overlay.width, overlay.height)
 
-  const r = Math.max(3.5, Math.min(7, 9 / Math.sqrt(origin.scale)))
+  // At 1:64 a world-wide scan puts thousands of markers a few pixels apart,
+  // so markers shrink with the zoom and drop their outline once the view is
+  // crowded. Without this the map turns into a solid carpet of dots.
+  const dense = features.value.length > 900
+  const r = dense
+    ? Math.max(2.4, Math.min(4, 7 / Math.sqrt(origin.scale)))
+    : Math.max(3.4, Math.min(8, 11 / Math.sqrt(origin.scale)))
   for (const feature of features.value) {
     if (!activeKinds.value.has(feature.kind)) continue
     const px = (feature.x - origin.x) / origin.scale
@@ -308,8 +614,34 @@ function drawMarkers() {
     ctx.arc(px, pz, r, 0, Math.PI * 2)
     ctx.fillStyle = meta.color
     ctx.fill()
+    if (!dense) {
+      ctx.lineWidth = 2
+      ctx.strokeStyle = 'rgba(12,12,14,0.85)'
+      ctx.stroke()
+    }
+  }
+  ctx.globalAlpha = 1
+
+  // Ore candidates are drawn as small squares so they stay distinguishable
+  // from the round structure markers at every zoom level.
+  const oreSize = Math.max(2, Math.min(4, 6 / Math.sqrt(origin.scale)))
+  for (const hit of oreHits.value) {
+    const px = (hit.x - origin.x) / origin.scale
+    const pz = (hit.z - origin.z) / origin.scale
+    if (px < -4 || pz < -4 || px > overlay.width + 4 || pz > overlay.height + 4) {
+      continue
+    }
+    ctx.fillStyle = oreMeta(hit.ore).color
+    ctx.fillRect(px - oreSize / 2, pz - oreSize / 2, oreSize, oreSize)
+  }
+
+  if (selected.value) {
+    const px = (selected.value.x - origin.x) / origin.scale
+    const pz = (selected.value.z - origin.z) / origin.scale
+    ctx.beginPath()
+    ctx.arc(px, pz, r + 5, 0, Math.PI * 2)
+    ctx.strokeStyle = '#ff77b9'
     ctx.lineWidth = 2
-    ctx.strokeStyle = 'rgba(12,12,14,0.85)'
     ctx.stroke()
   }
 }
@@ -317,6 +649,9 @@ function drawMarkers() {
 function applySeed() {
   seedValue.value = seedInput.value.trim() || '0'
   panel.value = null
+  selected.value = null
+  clearOres()
+  rememberSeed()
   void jumpToSpawn()
 }
 
@@ -572,6 +907,11 @@ function onPointerUp(event: PointerEvent) {
       } else {
         lastTapAt = now
         lastTapPos = { x: event.clientX, y: event.clientY }
+        const hit = pickFeature(event.clientX, event.clientY)
+        if (!hit && wasMobileTouch && selected.value) {
+          selected.value = null
+          drawMarkers()
+        }
       }
       if (wasMobileTouch && !moved) {
         // A plain tap dismisses the probe; long press keeps it visible.
@@ -600,6 +940,15 @@ function openPanel(next: 'legend' | 'settings') {
   panel.value = panel.value === next ? null : next
 }
 
+function openTool(next: SidePanel) {
+  panel.value = null
+  selected.value = null
+  sidePanel.value = next
+  if (next === 'ores' && !activeOres.value.length) {
+    activeOres.value = [...defaultOres(dimension.value)]
+  }
+}
+
 function syncMobile() {
   const next = media?.matches ?? false
   if (next === isMobile.value) return
@@ -612,12 +961,50 @@ onMounted(async () => {
   isMobile.value = media.matches
   media.addEventListener('change', syncMobile)
 
+  history.value = loadHistory()
+  activeOres.value = [...defaultOres('overworld')]
+
   try {
     profiles.value = await fetchProfiles()
     const first = javaProfiles.value.find((profile) => profile.available)
     if (first) version.value = first.version
   } catch (reason) {
     error.value = String(reason)
+  }
+
+  const restored = loadWorkspace()
+  let resumed = false
+  if (restored && javaProfiles.value.some((profile) => profile.version === restored.version)) {
+    seedInput.value = restored.seed
+    seedValue.value = restored.seed
+    version.value = restored.version
+    if (restored.dimension === 'nether' || restored.dimension === 'end') {
+      dimension.value = restored.dimension
+    }
+    if (SCALES.includes(restored.scale)) scale.value = restored.scale
+    if (Number.isFinite(restored.x) && Number.isFinite(restored.z)) {
+      center.x = restored.x
+      center.z = restored.z
+      resumed = true
+    }
+  }
+
+  // Dragging a world folder or level.dat onto the window imports its seed.
+  try {
+    const { getCurrentWebview } = await import('@tauri-apps/api/webview')
+    await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === 'enter' || event.payload.type === 'over') {
+        dropActive.value = true
+      } else if (event.payload.type === 'leave') {
+        dropActive.value = false
+      } else if (event.payload.type === 'drop') {
+        dropActive.value = false
+        const path = event.payload.paths?.[0]
+        if (path) void importWorld(path)
+      }
+    })
+  } catch {
+    // Running in a plain browser (vite dev without the shell): no drag-drop API.
   }
 
   if (isMobile.value) {
@@ -637,7 +1024,13 @@ onMounted(async () => {
     viewport.h = mapWrap.value.clientHeight
   }
 
-  await jumpToSpawn()
+  rememberSeed()
+
+  if (resumed) {
+    await repaint()
+  } else {
+    await jumpToSpawn()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -746,6 +1139,110 @@ onBeforeUnmount(() => {
         <button class="home" title="回到出生点" @click="jumpToSpawn">⌂</button>
       </div>
 
+      <nav v-if="!isMobile" class="side-dock">
+        <button
+          :class="{ active: sidePanel === 'biomes' }"
+          title="生物群系高亮"
+          @click="openSide('biomes')"
+        >
+          群系
+        </button>
+        <button
+          :class="{ active: sidePanel === 'ores' }"
+          :disabled="!oresSupported"
+          title="矿石分布"
+          @click="openSide('ores')"
+        >
+          矿石
+        </button>
+        <button
+          :class="{ active: sidePanel === 'underground' }"
+          :disabled="!undergroundSupported"
+          title="地下剖面"
+          @click="openSide('underground')"
+        >
+          剖面
+        </button>
+        <button
+          :class="{ active: sidePanel === 'analysis' }"
+          title="区域分析"
+          @click="openSide('analysis')"
+        >
+          分析
+        </button>
+        <button
+          :class="{ active: sidePanel === 'history' }"
+          title="最近种子"
+          @click="openSide('history')"
+        >
+          历史
+        </button>
+        <button :class="{ active: showLegend }" title="结构图例" @click="showLegend = !showLegend">
+          图例
+        </button>
+      </nav>
+
+      <div v-if="sidePanel || selected" class="side-panel">
+        <BiomePanel
+          v-if="sidePanel === 'biomes'"
+          :biomes="currentProfile?.biomes ?? []"
+          :selected="highlightBiomes"
+          @update:selected="onBiomesChanged"
+          @close="sidePanel = null"
+        />
+        <OrePanel
+          v-else-if="sidePanel === 'ores'"
+          :dimension="dimension"
+          :supported="oresSupported"
+          :active="activeOres"
+          :scanning="oreScanning"
+          :status="oreStatus"
+          :hits="oreHits.length"
+          @update:active="setOres"
+          @scan="scanViewportOres"
+          @clear="clearOres"
+          @close="sidePanel = null"
+        />
+        <UndergroundPanel
+          v-else-if="sidePanel === 'underground'"
+          :seed="seedValue"
+          edition="java"
+          :version="version"
+          :dimension="dimension"
+          :center="center"
+          :profile="currentProfile"
+          @close="sidePanel = null"
+        />
+        <AnalysisPanel
+          v-else-if="sidePanel === 'analysis'"
+          :features="features"
+          :seed="seedValue"
+          edition="java"
+          :version="version"
+          :dimension="dimension"
+          :bounds="viewBounds"
+          @close="sidePanel = null"
+        />
+        <HistoryPanel
+          v-else-if="sidePanel === 'history'"
+          :entries="history"
+          :current="seedValue"
+          @pick="pickHistory"
+          @remove="forgetHistory"
+          @clear="wipeHistory"
+          @close="sidePanel = null"
+        />
+        <StructurePanel
+          v-else-if="selected"
+          :feature="selected"
+          :seed="seedValue"
+          edition="java"
+          :version="version"
+          :dimension="dimension"
+          @close="selected = null"
+        />
+      </div>
+
       <section v-if="!isMobile && showLegend" class="legend">
         <header>
           <span>结构 · {{ features.length }}</span>
@@ -768,14 +1265,6 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </section>
-      <button
-        v-if="!isMobile && !showLegend"
-        class="legend-toggle"
-        @click="showLegend = true"
-      >
-        图例
-      </button>
-
       <footer class="hud">
         <span>X {{ Math.round(center.x) }} · Z {{ Math.round(center.z) }}</span>
         <span v-if="!isMobile" class="dim">光标 {{ hover.x }} , {{ hover.z }}</span>
@@ -800,6 +1289,12 @@ onBeforeUnmount(() => {
 
       <div v-if="error" class="error">{{ error }}</div>
 
+      <div v-if="dropActive" class="drop-hint">
+        <span>松开以导入存档</span>
+        <em>level.dat 或解压后的世界文件夹</em>
+      </div>
+      <div v-if="importNote" class="toast">{{ importNote }}</div>
+
       <!-- mobile floating dock -->
       <nav v-if="isMobile" class="dock">
         <div class="dock-dims">
@@ -815,6 +1310,7 @@ onBeforeUnmount(() => {
         <button class="dock-btn" @click="openPanel('legend')">
           图例<em v-if="features.length">{{ features.length }}</em>
         </button>
+        <button class="dock-btn" @click="openPanel('settings')">工具</button>
         <button class="dock-btn" aria-label="回到出生点" @click="jumpToSpawn">⌂</button>
       </nav>
 
@@ -883,6 +1379,15 @@ onBeforeUnmount(() => {
               <b>{{ lastMs }} ms · 1 px = {{ scale }} 格</b>
             </div>
             <button class="btn ghost" @click="resetView">重置视图</button>
+            <div class="tool-grid">
+              <button :disabled="!oresSupported" @click="openTool('ores')">矿石分布</button>
+              <button :disabled="!undergroundSupported" @click="openTool('underground')">
+                地下剖面
+              </button>
+              <button @click="openTool('biomes')">群系高亮</button>
+              <button @click="openTool('analysis')">区域分析</button>
+              <button @click="openTool('history')">最近种子</button>
+            </div>
             <p class="hint">单指拖动平移 · 双指捏合缩放 · 双击放大 · 长按查群系</p>
           </div>
         </section>
@@ -1707,9 +2212,144 @@ canvas.overlay {
   transform: translateY(100%);
 }
 
+/* --- 右侧工具列与浮层 --------------------------------------------------- */
+
+.side-dock {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+  background: rgba(24, 24, 28, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  backdrop-filter: blur(14px);
+}
+
+.side-dock button {
+  width: 42px;
+  height: 28px;
+  border-radius: 7px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.side-dock button:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.side-dock button.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.side-dock button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.side-panel {
+  position: absolute;
+  right: 68px;
+  top: 14px;
+  z-index: 6;
+  max-height: calc(100% - 64px);
+  display: flex;
+}
+
+.drop-hint {
+  position: absolute;
+  inset: 12px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 2px dashed rgba(255, 119, 185, 0.6);
+  border-radius: 14px;
+  background: rgba(20, 12, 16, 0.72);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+.drop-hint span {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.drop-hint em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  z-index: 7;
+  max-width: 80%;
+  padding: 8px 14px;
+  border-radius: 9px;
+  background: rgba(28, 28, 34, 0.94);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.tool-grid button {
+  height: 34px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.tool-grid button:disabled {
+  opacity: 0.4;
+}
+
 @media (max-width: 860px) {
   .map-area {
     touch-action: none;
+  }
+
+  .side-panel {
+    position: fixed;
+    right: 0;
+    left: 0;
+    bottom: 0;
+    top: auto;
+    z-index: 30;
+    max-height: 78dvh;
+    justify-content: center;
+    padding: 0 8px;
+  }
+
+  .side-panel > * {
+    width: 100%;
+    max-width: none;
+    max-height: 78dvh;
+    border-radius: 16px 16px 0 0;
+  }
+
+  .toast {
+    bottom: 92px;
   }
 }
 </style>

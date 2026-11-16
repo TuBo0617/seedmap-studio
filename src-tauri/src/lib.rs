@@ -1,3 +1,5 @@
+mod seedmap_ext;
+
 use seedmap_core::{
     Dimension, Edition, FeatureQuery, MapFeature, SpawnPoint, TileRequest,
     VersionProfile,
@@ -86,6 +88,14 @@ pub fn run() {
             seedmap_find_features,
             seedmap_spawn,
             seedmap_biome_at,
+            seedmap_ext::seedmap_scan_ores,
+            seedmap_ext::seedmap_cancel_ore_scan,
+            seedmap_ext::seedmap_read_level_dat,
+            seedmap_ext::seedmap_structure_details,
+            seedmap_ext::seedmap_container_loot,
+            seedmap_ext::seedmap_underground_tile,
+            seedmap_ext::seedmap_underground_volume,
+            seedmap_ext::seedmap_cancel_underground,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seedmap Studio");
