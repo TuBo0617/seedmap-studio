@@ -189,6 +189,11 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
+      # `tauri ios init` shells out to XcodeGen, which the runner image
+      # does not ship.
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
       - name: Generate Xcode project
         run: pnpm tauri ios init --ci
 
@@ -198,19 +203,24 @@ jobs:
       - name: Build unsigned app
         run: pnpm tauri ios build --target aarch64-apple-ios --release --no-sign
 
-      - name: Package unsigned ipa
+      - name: Collect unsigned ipa
         run: |
-          APP=$(find src-tauri/gen/apple/build -maxdepth 4 -name "*.app" -type d | head -1)
-          echo "app bundle: $APP"
-          rm -rf Payload Seedmap-Studio-unsigned.ipa
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qry Seedmap-Studio-unsigned.ipa Payload
+          mkdir -p out
+          find src-tauri/gen/apple -name "*.ipa" -type f -exec cp {} out/ \;
+          if [ -z "$(ls -A out)" ]; then
+            echo "no ipa from the bundler, zipping the .app by hand"
+            APP=$(find src-tauri/gen/apple -name "*.app" -type d | head -1)
+            echo "app bundle: $APP"
+            mkdir -p Payload && cp -R "$APP" Payload/
+            zip -qry out/Seedmap-Studio-unsigned.ipa Payload
+          fi
+          VERSION=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          IPA=$(ls out/*.ipa | head -1)
+          mv "$IPA" "out/Seedmap-Studio-${VERSION}-ios-unsigned.ipa"
+          ls -lh out
 
       - uses: actions/upload-artifact@v4
         with:
           name: ios-unsigned
           if-no-files-found: error
-          path: |
-            Seedmap-Studio-unsigned.ipa
-            src-tauri/gen/apple/build/**/*.app
+          path: out/*.ipa
