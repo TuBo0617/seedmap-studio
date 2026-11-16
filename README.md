@@ -57,10 +57,10 @@
 
 Android 默认产出**一个通用 APK，同时包含 4 个 ABI**，不需要为不同设备分包；`minSdk` 为 24（Android 7.0）。
 iOS 的部署目标写成 **13.0**，这是 Tauri 2 / WKWebView 的下限（`UIWindowScene` 从 iOS 13 才有），
-再往下没有可用的运行时支持。需要说明的是 Apple 从 Xcode 16 起只允许把部署目标设到 iOS 15
-（更低的档位会被 Xcode clamp 到 15），所以：**用 Xcode 15 构建 → 真正支持 iOS 13/14；
-用 Xcode 16/26 构建 → 实际最低 iOS 15**。CI 用的是 Xcode 26，产物属于后者；配置层面保持 13.0，
-换到 Xcode 15 就能直接出覆盖 iOS 13 的包。
+再往下没有可用的运行时支持。CI 用 Xcode 26.5 的 SDK 构建，产物的 `Info.plist` 里
+`MinimumOSVersion` 实测就是 **13.0**（`DTSDKName: iphoneos26.5`），没有被抬到 15。
+不过 iOS 13/14 真机没有实测过：声明的最低版本只代表二进制允许安装的系统下限，
+实际能不能跑还取决于系统框架的可用 API。
 
 CI（`.github/workflows/build.yml`）按这张表跑矩阵，标签 push 时产出全部安装包。
 
@@ -157,17 +157,33 @@ pnpm tauri android build --apk --split-per-abi  # 四个独立 APK
 ```bash
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 pnpm install && pnpm build
+brew install xcodegen          # `tauri ios init` 会调用它
 pnpm tauri ios init --ci
-pnpm tauri ios build --target aarch64-apple-ios --release
+pnpm tauri ios build --target aarch64        # 真机；模拟器用 aarch64-sim / x86_64
 ```
 
-未签名产物可以用 `--no-sign` 生成（CI 就是这么做的），再用 AltStore、Sideloadly
-或 `codesign -f -s "Apple Development: ..."` 重签后安装。真机调试需要在
-`tauri.conf.json` 的 `bundle.iOS.developmentTeam` 填上 Team ID，或者直接用 Xcode
-打开 `src-tauri/gen/apple/seedmap_studio.xcodeproj` 选个人开发者账号。
+命令里的 `--target` 是 Tauri 自己的名字（`aarch64` / `aarch64-sim` / `x86_64`），
+不是 Rust 三元组；`ios build` 默认就是 release，没有 `--release` 这个参数。
+
+未签名产物用 `--no-sign` 生成，产物是可直接重签的 `.ipa`：
+
+```bash
+pnpm tauri ios build --target aarch64 --no-sign
+# src-tauri/gen/apple/build/arm64/Seedmap Studio.ipa
+```
+
+再用 AltStore、Sideloadly 或 `codesign -f -s "Apple Development: ..."` 重签后安装。
+真机调试需要在 `tauri.conf.json` 的 `bundle.iOS.developmentTeam` 填上 Team ID
+（或设 `APPLE_DEVELOPMENT_TEAM` 环境变量），也可以直接用 Xcode 打开
+`src-tauri/gen/apple/seedmap-studio.xcodeproj` 选个人开发者账号。
 
 > Apple SDK 不能交叉编译，Linux / Windows 上无法产出 iOS 包；这也是 CI 把 iOS 单独
 > 放在 `macos-26` 上的原因。
+
+**只跑 iOS 的 CI**：Actions → `build` → Run workflow，把 `jobs` 选成 `ios`。
+CI 没有 Apple 证书，所以走 `--no-sign`，`APPLE_DEVELOPMENT_TEAM` 用占位值只为
+通过 Xcode 工程的团队校验。跑完在 run 页面下载 `ios-unsigned` 工件，里面是
+`Seedmap-Studio-<版本>-ios-unsigned.ipa`。`jobs` 也可以选 `android` / `desktop` / `all`。
 
 ### 触屏操作
 
