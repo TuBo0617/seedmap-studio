@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  biomeAt,
   fetchProfiles,
   findFeatures,
   findSpawn,
@@ -10,6 +11,7 @@ import {
   type VersionProfile,
 } from './lib/api'
 import { DEFAULT_KINDS, FEATURE_BITS, featureMeta, LEGEND_ORDER } from './lib/features'
+import { biomeName } from './lib/biomes'
 
 const seedInput = ref('10292992')
 const seedValue = ref('10292992')
@@ -38,10 +40,51 @@ const dragging = ref(false)
 const dragOffset = reactive({ x: 0, z: 0 })
 const hover = reactive({ x: 0, z: 0 })
 
+// --- mobile / touch state -------------------------------------------------
+
+const MOBILE_QUERY = '(max-width: 860px), (pointer: coarse)'
+const isMobile = ref(false)
+const panel = ref<'legend' | 'settings' | null>(null)
+const probe = ref<
+  | { x: number; z: number; biome: string; left: number; top: number }
+  | null
+>(null)
+
+/** Live CSS transform applied while dragging or pinching. */
+const view = reactive({ tx: 0, tz: 0, zoom: 1, ox: 0, oy: 0 })
+const pinchActive = ref(false)
+
+const stackStyle = computed(() => ({
+  transform: `translate3d(${view.tx}px, ${view.tz}px, 0) scale(${view.zoom})`,
+  transformOrigin: `${view.ox}px ${view.oy}px`,
+}))
+
+let media: MediaQueryList | null = null
 let renderSeq = 0
 let origin = { x: 0, z: 0, scale: 4, w: 1, h: 1 }
-let dragStart: { x: number; y: number; cx: number; cz: number } | null = null
 let observer: ResizeObserver | null = null
+
+interface GestureState {
+  mode: 'drag' | 'pinch'
+  startX: number
+  startY: number
+  centerX: number
+  centerZ: number
+  distance: number
+  scale: number
+  focusX: number
+  focusY: number
+  focusClientX: number
+  focusClientY: number
+  moved: boolean
+}
+
+let gesture: GestureState | null = null
+const pointers = new Map<number, { x: number; y: number }>()
+let longPressTimer: number | undefined
+let longPressOrigin = { x: 0, y: 0 }
+let lastTapAt = 0
+let lastTapPos = { x: 0, y: 0 }
 
 const javaProfiles = computed(() =>
   profiles.value.filter((profile) => profile.edition === 'java'),
@@ -146,8 +189,8 @@ async function repaint() {
   const ctx = canvas.getContext('2d')
   if (!ctx) return
 
-  const w = Math.max(320, Math.floor(viewport.w))
-  const h = Math.max(240, Math.floor(viewport.h))
+  const w = Math.max(240, Math.floor(viewport.w))
+  const h = Math.max(200, Math.floor(viewport.h))
   if (canvas.width !== w) canvas.width = w
   if (canvas.height !== h) canvas.height = h
 
@@ -273,6 +316,7 @@ function drawMarkers() {
 
 function applySeed() {
   seedValue.value = seedInput.value.trim() || '0'
+  panel.value = null
   void jumpToSpawn()
 }
 
@@ -298,6 +342,30 @@ function stepScale(direction: 1 | -1) {
   void repaint()
 }
 
+/** Changes the zoom level while keeping the world point under the cursor. */
+function scaleAtPoint(next: number, clientX: number, clientY: number) {
+  const canvas = canvasRef.value
+  if (!canvas) return
+  if (next === scale.value) return
+  const rect = canvas.getBoundingClientRect()
+  const mx = clientX - rect.left
+  const my = clientY - rect.top
+  const worldX = center.x + (mx - origin.w / 2) * scale.value
+  const worldZ = center.z + (my - origin.h / 2) * scale.value
+  scale.value = next
+  center.x = worldX - (mx - origin.w / 2) * next
+  center.z = worldZ - (my - origin.h / 2) * next
+  void repaint()
+}
+
+function nearestScale(value: number) {
+  return SCALES.reduce((best, candidate) =>
+    Math.abs(Math.log(candidate / value)) < Math.abs(Math.log(best / value))
+      ? candidate
+      : best,
+  )
+}
+
 function resetView() {
   scale.value = 4
   center.x = 0
@@ -307,66 +375,243 @@ function resetView() {
 
 function onWheel(event: WheelEvent) {
   event.preventDefault()
-  const canvas = canvasRef.value
-  if (!canvas) return
   const index = SCALES.indexOf(scale.value)
   const nextIndex = Math.min(
     SCALES.length - 1,
     Math.max(0, (index < 0 ? 1 : index) + (event.deltaY < 0 ? -1 : 1)),
   )
   if (nextIndex === index) return
-  const next = SCALES[nextIndex]
+  scaleAtPoint(SCALES[nextIndex], event.clientX, event.clientY)
+}
+
+// --- pointer & touch handling --------------------------------------------
+
+function cancelLongPress() {
+  if (longPressTimer !== undefined) {
+    window.clearTimeout(longPressTimer)
+    longPressTimer = undefined
+  }
+}
+
+async function runProbe(clientX: number, clientY: number) {
+  const canvas = canvasRef.value
+  const wrap = mapWrap.value
+  if (!canvas || !wrap) return
   const rect = canvas.getBoundingClientRect()
-  const mx = event.clientX - rect.left
-  const my = event.clientY - rect.top
-  const worldX = center.x + (mx - origin.w / 2) * scale.value
-  const worldZ = center.z + (my - origin.h / 2) * scale.value
-  scale.value = next
-  center.x = worldX - (mx - origin.w / 2) * next
-  center.z = worldZ - (my - origin.h / 2) * next
-  void repaint()
+  const wrapRect = wrap.getBoundingClientRect()
+  const wx = Math.round(center.x + (clientX - rect.left - origin.w / 2) * scale.value)
+  const wz = Math.round(center.z + (clientY - rect.top - origin.h / 2) * scale.value)
+  probe.value = {
+    x: wx,
+    z: wz,
+    biome: '查询中…',
+    left: clientX - wrapRect.left,
+    top: clientY - wrapRect.top,
+  }
+  try {
+    const id = await biomeAt(
+      seedValue.value,
+      'java',
+      version.value,
+      dimension.value,
+      wx,
+      dimension.value === 'overworld' ? 64 : 64,
+      wz,
+    )
+    if (probe.value && probe.value.x === wx && probe.value.z === wz) {
+      probe.value = { ...probe.value, biome: biomeName(id) }
+    }
+  } catch {
+    if (probe.value) probe.value = { ...probe.value, biome: '无法读取' }
+  }
+  navigator.vibrate?.(12)
+}
+
+function beginLongPress(event: PointerEvent) {
+  cancelLongPress()
+  longPressOrigin = { x: event.clientX, y: event.clientY }
+  longPressTimer = window.setTimeout(() => {
+    longPressTimer = undefined
+    if (gesture && gesture.moved) return
+    void runProbe(longPressOrigin.x, longPressOrigin.y)
+  }, 460)
 }
 
 function onPointerDown(event: PointerEvent) {
-  if (event.button !== 0) return
-  dragStart = {
-    x: event.clientX,
-    y: event.clientY,
-    cx: center.x,
-    cz: center.z,
+  if (event.button !== 0 && event.pointerType === 'mouse') return
+  const canvas = canvasRef.value
+  if (!canvas) return
+  canvas.setPointerCapture(event.pointerId)
+  pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+  probe.value = null
+
+  if (pointers.size === 1) {
+    gesture = {
+      mode: 'drag',
+      startX: event.clientX,
+      startY: event.clientY,
+      centerX: center.x,
+      centerZ: center.z,
+      distance: 0,
+      scale: scale.value,
+      focusX: 0,
+      focusY: 0,
+      focusClientX: 0,
+      focusClientY: 0,
+      moved: false,
+    }
+    dragging.value = true
+    pinchActive.value = false
+    view.zoom = 1
+    beginLongPress(event)
+  } else if (pointers.size === 2) {
+    cancelLongPress()
+    const [a, b] = [...pointers.values()]
+    const rect = canvas.getBoundingClientRect()
+    const focusClientX = (a.x + b.x) / 2
+    const focusClientY = (a.y + b.y) / 2
+    gesture = {
+      mode: 'pinch',
+      startX: 0,
+      startY: 0,
+      centerX: center.x,
+      centerZ: center.z,
+      distance: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      scale: scale.value,
+      focusX: focusClientX - rect.left,
+      focusY: focusClientY - rect.top,
+      focusClientX,
+      focusClientY,
+      moved: true,
+    }
+    dragging.value = false
+    pinchActive.value = true
+    view.tx = 0
+    view.tz = 0
+    view.zoom = 1
+    view.ox = gesture.focusX
+    view.oy = gesture.focusY
   }
-  dragging.value = true
-  canvasRef.value?.setPointerCapture(event.pointerId)
 }
 
 function onPointerMove(event: PointerEvent) {
   const canvas = canvasRef.value
-  if (canvas) {
-    const rect = canvas.getBoundingClientRect()
+  if (!canvas) return
+  if (pointers.has(event.pointerId)) {
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+  }
+
+  if (gesture?.mode === 'pinch' && pointers.size >= 2) {
+    const [a, b] = [...pointers.values()]
+    const distance = Math.hypot(a.x - b.x, a.y - b.y) || 1
+    const factor = Math.min(6, Math.max(0.2, distance / gesture.distance))
+    view.zoom = factor
+    return
+  }
+
+  if (gesture?.mode === 'drag') {
+    const dx = event.clientX - gesture.startX
+    const dy = event.clientY - gesture.startY
+    if (Math.hypot(dx, dy) > 6) {
+      gesture.moved = true
+      cancelLongPress()
+    }
+    view.tx = dx
+    view.tz = dy
+    center.x = gesture.centerX - dx * scale.value
+    center.z = gesture.centerZ - dy * scale.value
     hover.x = Math.round(
-      center.x + (event.clientX - rect.left - origin.w / 2) * scale.value,
+      center.x + (event.clientX - canvas.getBoundingClientRect().left - origin.w / 2) * scale.value,
     )
     hover.z = Math.round(
-      center.z + (event.clientY - rect.top - origin.h / 2) * scale.value,
+      center.z + (event.clientY - canvas.getBoundingClientRect().top - origin.h / 2) * scale.value,
     )
   }
-  if (!dragStart) return
-  dragOffset.x = event.clientX - dragStart.x
-  dragOffset.z = event.clientY - dragStart.y
-  center.x = dragStart.cx - dragOffset.x * scale.value
-  center.z = dragStart.cz - dragOffset.z * scale.value
 }
 
-function onPointerUp() {
-  if (!dragStart) return
-  dragStart = null
-  dragging.value = false
-  dragOffset.x = 0
-  dragOffset.z = 0
-  void repaint()
+function onPointerUp(event: PointerEvent) {
+  pointers.delete(event.pointerId)
+  cancelLongPress()
+
+  if (gesture?.mode === 'pinch') {
+    if (pointers.size >= 1) return
+    const factor = view.zoom
+    const target = nearestScale(gesture.scale / factor)
+    const { focusClientX, focusClientY } = gesture
+    pinchActive.value = false
+    view.zoom = 1
+    view.ox = 0
+    view.oy = 0
+    gesture = null
+    dragging.value = false
+    if (target !== scale.value) {
+      scaleAtPoint(target, focusClientX, focusClientY)
+    }
+    return
+  }
+
+  if (gesture?.mode === 'drag') {
+    const moved = gesture.moved
+    const wasMobileTouch = event.pointerType !== 'mouse'
+    gesture = null
+    dragging.value = false
+    view.tx = 0
+    view.tz = 0
+    dragOffset.x = 0
+    dragOffset.z = 0
+
+    if (!moved) {
+      const now = performance.now()
+      const near =
+        Math.hypot(event.clientX - lastTapPos.x, event.clientY - lastTapPos.y) < 44
+      if (now - lastTapAt < 320 && near) {
+        const index = SCALES.indexOf(scale.value)
+        const nextIndex = Math.max(0, index - 1)
+        lastTapAt = 0
+        if (nextIndex !== index) scaleAtPoint(SCALES[nextIndex], event.clientX, event.clientY)
+      } else {
+        lastTapAt = now
+        lastTapPos = { x: event.clientX, y: event.clientY }
+      }
+      if (wasMobileTouch && !moved) {
+        // A plain tap dismisses the probe; long press keeps it visible.
+        probe.value = null
+      }
+    }
+    void repaint()
+  }
+}
+
+function onPointerCancel(event: PointerEvent) {
+  pointers.delete(event.pointerId)
+  cancelLongPress()
+  if (pointers.size === 0) {
+    gesture = null
+    dragging.value = false
+    pinchActive.value = false
+    view.zoom = 1
+    view.tx = 0
+    view.tz = 0
+    void repaint()
+  }
+}
+
+function openPanel(next: 'legend' | 'settings') {
+  panel.value = panel.value === next ? null : next
+}
+
+function syncMobile() {
+  const next = media?.matches ?? false
+  if (next === isMobile.value) return
+  isMobile.value = next
+  if (!next) panel.value = null
 }
 
 onMounted(async () => {
+  media = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = media.matches
+  media.addEventListener('change', syncMobile)
+
   try {
     profiles.value = await fetchProfiles()
     const first = javaProfiles.value.find((profile) => profile.available)
@@ -375,12 +620,17 @@ onMounted(async () => {
     error.value = String(reason)
   }
 
+  if (isMobile.value) {
+    scale.value = 16
+  }
+
   if (mapWrap.value) {
     observer = new ResizeObserver((entries) => {
       const box = entries[0]?.contentRect
       if (!box) return
       viewport.w = box.width
       viewport.h = box.height
+      if (hasPainted.value && !dragging.value) void repaint()
     })
     observer.observe(mapWrap.value)
     viewport.w = mapWrap.value.clientWidth
@@ -390,21 +640,25 @@ onMounted(async () => {
   await jumpToSpawn()
 })
 
-onBeforeUnmount(() => observer?.disconnect())
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  media?.removeEventListener('change', syncMobile)
+  cancelLongPress()
+})
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :class="{ mobile: isMobile }">
     <header class="topbar">
       <div class="brand">
         <div class="logo" />
         <div class="brand-text">
           <div class="name">Seedmap Studio</div>
-          <div class="sub">Minecraft 种子地图</div>
+          <div v-if="!isMobile" class="sub">Minecraft 种子地图</div>
         </div>
       </div>
 
-      <div class="controls">
+      <div v-if="!isMobile" class="controls">
         <label class="field seed">
           <span>种子</span>
           <input
@@ -436,36 +690,63 @@ onBeforeUnmount(() => observer?.disconnect())
         </div>
       </div>
 
-      <div class="engine" :class="{ warn: !engineReady }">
+      <div v-if="!isMobile" class="engine" :class="{ warn: !engineReady }">
         {{ engineReady ? 'cubiomes 引擎就绪' : '引擎不可用' }}
       </div>
+
+      <button
+        v-else
+        class="mobile-more"
+        :class="{ open: panel === 'settings' }"
+        aria-label="设置"
+        @click="openPanel('settings')"
+      >
+        <i /><i /><i />
+      </button>
     </header>
 
-    <main ref="mapWrap" class="map-area">
-      <canvas
-        ref="canvasRef"
-        class="layer"
-        :style="{ transform: `translate(${dragOffset.x}px, ${dragOffset.z}px)` }"
-        @wheel.prevent="onWheel"
-        @pointerdown="onPointerDown"
-        @pointermove="onPointerMove"
-        @pointerup="onPointerUp"
-        @pointercancel="onPointerUp"
-      />
-      <canvas
-        ref="overlayRef"
-        class="layer overlay"
-        :style="{ transform: `translate(${dragOffset.x}px, ${dragOffset.z}px)` }"
-      />
+    <div v-if="isMobile" class="mobile-search">
+      <label class="seed-box">
+        <span>种子</span>
+        <input
+          v-model="seedInput"
+          inputmode="text"
+          spellcheck="false"
+          enterkeyhint="go"
+          @keydown.enter="applySeed"
+        />
+      </label>
+      <button class="btn primary" @click="applySeed">生成</button>
+    </div>
 
-      <div class="zoom">
+    <main ref="mapWrap" class="map-area">
+      <div class="map-stack" :style="stackStyle">
+        <canvas
+          ref="canvasRef"
+          class="layer"
+          @wheel.prevent="onWheel"
+          @pointerdown="onPointerDown"
+          @pointermove="onPointerMove"
+          @pointerup="onPointerUp"
+          @pointercancel="onPointerCancel"
+        />
+        <canvas ref="overlayRef" class="layer overlay" />
+      </div>
+
+      <div v-if="isMobile" class="zoom-rail">
+        <button aria-label="放大" @click="stepScale(-1)">＋</button>
+        <span>{{ scaleLabel }}</span>
+        <button aria-label="缩小" @click="stepScale(1)">－</button>
+      </div>
+
+      <div v-if="!isMobile" class="zoom">
         <button title="放大" @click="stepScale(-1)">＋</button>
         <div class="zoom-label">{{ scaleLabel }}</div>
         <button title="缩小" @click="stepScale(1)">－</button>
         <button class="home" title="回到出生点" @click="jumpToSpawn">⌂</button>
       </div>
 
-      <section v-if="showLegend" class="legend">
+      <section v-if="!isMobile && showLegend" class="legend">
         <header>
           <span>结构 · {{ features.length }}</span>
           <button @click="showLegend = false">×</button>
@@ -487,17 +768,30 @@ onBeforeUnmount(() => observer?.disconnect())
           </div>
         </div>
       </section>
-      <button v-else class="legend-toggle" @click="showLegend = true">
+      <button
+        v-if="!isMobile && !showLegend"
+        class="legend-toggle"
+        @click="showLegend = true"
+      >
         图例
       </button>
 
       <footer class="hud">
         <span>X {{ Math.round(center.x) }} · Z {{ Math.round(center.z) }}</span>
-        <span class="dim">光标 {{ hover.x }} , {{ hover.z }}</span>
+        <span v-if="!isMobile" class="dim">光标 {{ hover.x }} , {{ hover.z }}</span>
         <span>1 像素 = {{ scale }} 格</span>
-        <span>{{ lastMs }} ms</span>
+        <span v-if="!isMobile">{{ lastMs }} ms</span>
         <span v-if="busy" class="busy">渲染中…</span>
       </footer>
+
+      <div
+        v-if="probe"
+        class="probe"
+        :style="{ left: `${probe.left}px`, top: `${probe.top}px` }"
+      >
+        <b>{{ probe.biome }}</b>
+        <span>X {{ probe.x }} · Y 64 · Z {{ probe.z }}</span>
+      </div>
 
       <div v-if="busy && !hasPainted" class="splash">
         <div class="spinner" />
@@ -505,6 +799,94 @@ onBeforeUnmount(() => observer?.disconnect())
       </div>
 
       <div v-if="error" class="error">{{ error }}</div>
+
+      <!-- mobile floating dock -->
+      <nav v-if="isMobile" class="dock">
+        <div class="dock-dims">
+          <button
+            v-for="item in dimensions"
+            :key="item"
+            :class="{ active: dimension === item }"
+            @click="dimension = item"
+          >
+            {{ DIM_LABEL[item] }}
+          </button>
+        </div>
+        <button class="dock-btn" @click="openPanel('legend')">
+          图例<em v-if="features.length">{{ features.length }}</em>
+        </button>
+        <button class="dock-btn" aria-label="回到出生点" @click="jumpToSpawn">⌂</button>
+      </nav>
+
+      <div v-if="isMobile && panel" class="scrim" @click="panel = null" />
+
+      <transition name="sheet">
+        <section v-if="isMobile && panel" class="sheet">
+          <header>
+            <span>{{ panel === 'legend' ? '结构图例' : '设置' }}</span>
+            <button aria-label="关闭" @click="panel = null">×</button>
+          </header>
+
+          <div v-if="panel === 'legend'" class="sheet-body">
+            <div class="legend-actions">
+              <button @click="selectAllKinds(true)">全部显示</button>
+              <button @click="selectAllKinds(false)">全部隐藏</button>
+            </div>
+            <div class="legend-list">
+              <div
+                v-for="item in legendItems"
+                :key="item.kind"
+                :class="{ off: !item.active }"
+                @click="toggleKind(item.kind)"
+              >
+                <i :style="{ background: item.active ? item.color : '#4a4a52' }" />
+                <span>{{ item.label }}</span>
+                <b v-if="item.active">{{ item.count }}</b>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="sheet-body settings">
+            <label class="row">
+              <span>种子</span>
+              <input v-model="seedInput" spellcheck="false" @keydown.enter="applySeed" />
+            </label>
+            <label class="row">
+              <span>版本</span>
+              <select v-model="version">
+                <option v-for="item in versions" :key="item" :value="item">
+                  {{ item }}
+                </option>
+              </select>
+            </label>
+            <div class="row">
+              <span>维度</span>
+              <div class="segmented">
+                <button
+                  v-for="item in dimensions"
+                  :key="item"
+                  :class="{ active: dimension === item }"
+                  @click="dimension = item"
+                >
+                  {{ DIM_LABEL[item] }}
+                </button>
+              </div>
+            </div>
+            <div class="row static">
+              <span>引擎</span>
+              <b :class="{ warn: !engineReady }">
+                {{ engineReady ? 'cubiomes 就绪' : '不可用' }}
+              </b>
+            </div>
+            <div class="row static">
+              <span>渲染</span>
+              <b>{{ lastMs }} ms · 1 px = {{ scale }} 格</b>
+            </div>
+            <button class="btn ghost" @click="resetView">重置视图</button>
+            <p class="hint">单指拖动平移 · 双指捏合缩放 · 双击放大 · 长按查群系</p>
+          </div>
+        </section>
+      </transition>
     </main>
   </div>
 </template>
@@ -514,7 +896,24 @@ onBeforeUnmount(() => observer?.disconnect())
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   background: var(--bg);
+}
+
+/* WKWebView reports real safe-area insets; Android is inset natively in
+   MainActivity, so only iOS needs the CSS padding. */
+@supports (-webkit-touch-callout: none) {
+  .app {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .dock {
+    bottom: calc(10px + env(safe-area-inset-bottom));
+  }
+
+  .sheet {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
 }
 
 .topbar {
@@ -625,6 +1024,13 @@ onBeforeUnmount(() => observer?.disconnect())
   filter: brightness(1.06);
 }
 
+.btn.ghost {
+  margin-top: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
 .segmented {
   display: flex;
   padding: 3px;
@@ -664,12 +1070,110 @@ onBeforeUnmount(() => observer?.disconnect())
   border-color: rgba(227, 160, 107, 0.25);
 }
 
+/* ---------------- mobile ---------------- */
+
+.app.mobile {
+  overscroll-behavior: none;
+}
+
+.app.mobile .topbar {
+  height: 50px;
+  padding: 0 10px 0 12px;
+  gap: 10px;
+}
+
+.app.mobile .logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+
+.app.mobile .brand-text .name {
+  font-size: 13px;
+}
+
+.mobile-more {
+  margin-left: auto;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border-radius: 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+
+.mobile-more i {
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.mobile-more.open {
+  border-color: rgba(255, 119, 185, 0.4);
+}
+
+.mobile-more.open i {
+  background: var(--accent);
+}
+
+.mobile-search {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.seed-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  height: 40px;
+  padding: 0 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.seed-box input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 15px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.app.mobile .btn {
+  height: 40px;
+  padding: 0 16px;
+  font-size: 14px;
+  border-radius: 10px;
+}
+
 .map-area {
   position: relative;
   flex: 1;
   min-height: 0;
   overflow: hidden;
   background: #0e0e10;
+}
+
+.map-stack {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
 }
 
 canvas.layer {
@@ -761,6 +1265,42 @@ canvas.overlay {
   font-size: 13px;
 }
 
+.zoom-rail {
+  position: absolute;
+  right: calc(10px + env(safe-area-inset-right));
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 5px;
+  background: rgba(24, 24, 28, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(14px);
+}
+
+.zoom-rail button {
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  background: var(--panel-2);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.zoom-rail button:active {
+  background: #34343d;
+}
+
+.zoom-rail span {
+  font-size: 9.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  padding: 1px 0;
+}
+
 .legend {
   position: absolute;
   left: 14px;
@@ -830,12 +1370,6 @@ canvas.overlay {
   font-variant-numeric: tabular-nums;
 }
 
-.legend-list .empty {
-  color: var(--muted);
-  font-size: 11px;
-  padding: 8px;
-}
-
 .legend-toggle {
   position: absolute;
   left: 14px;
@@ -874,6 +1408,51 @@ canvas.overlay {
 .hud .busy {
   margin-left: auto;
   color: var(--accent);
+}
+
+.app.mobile .hud {
+  display: none;
+}
+
+.probe {
+  position: absolute;
+  z-index: 5;
+  transform: translate(-50%, calc(-100% - 14px));
+  min-width: 130px;
+  padding: 8px 11px;
+  border-radius: 10px;
+  background: rgba(18, 18, 21, 0.94);
+  border: 1px solid rgba(255, 119, 185, 0.35);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.probe b {
+  font-size: 12.5px;
+  color: #ffd0e7;
+  font-weight: 600;
+}
+
+.probe span {
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.probe::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 9px;
+  height: 9px;
+  transform: translateX(-50%) rotate(45deg);
+  background: rgba(18, 18, 21, 0.94);
+  border-right: 1px solid rgba(255, 119, 185, 0.35);
+  border-bottom: 1px solid rgba(255, 119, 185, 0.35);
 }
 
 .splash {
@@ -916,5 +1495,221 @@ canvas.overlay {
   color: #ffb4b4;
   background: rgba(120, 30, 35, 0.85);
   border: 1px solid rgba(255, 120, 120, 0.28);
+}
+
+/* ---------------- mobile dock & sheets ---------------- */
+
+.dock {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(10px + env(safe-area-inset-bottom));
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(24, 24, 28, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  backdrop-filter: blur(18px);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+}
+
+.dock-dims {
+  display: flex;
+  flex: 1;
+  gap: 3px;
+  padding: 3px;
+  background: var(--panel-2);
+  border-radius: 11px;
+}
+
+.dock-dims button {
+  flex: 1;
+  height: 38px;
+  border-radius: 9px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.dock-dims button.active {
+  background: var(--accent-soft);
+  color: #ff9ecb;
+}
+
+.dock-btn {
+  position: relative;
+  min-width: 48px;
+  height: 44px;
+  padding: 0 10px;
+  border-radius: 11px;
+  background: var(--panel-2);
+  font-size: 13px;
+  color: #d6d6de;
+}
+
+.dock-btn:active {
+  background: #34343d;
+}
+
+.dock-btn em {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  font-size: 9px;
+  font-style: normal;
+  color: var(--accent);
+}
+
+.scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.sheet {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 8;
+  max-height: 68%;
+  display: flex;
+  flex-direction: column;
+  background: #1b1b20;
+  border-top: 1px solid var(--border);
+  border-radius: 18px 18px 0 0;
+  box-shadow: 0 -18px 40px rgba(0, 0, 0, 0.55);
+}
+
+.sheet header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.sheet header button {
+  width: 32px;
+  height: 32px;
+  font-size: 18px;
+  color: var(--muted);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.sheet-body {
+  overflow-y: auto;
+  padding: 0 12px 14px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sheet .legend-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  padding: 4px 0 0;
+}
+
+.sheet .legend-list div {
+  padding: 9px 8px;
+  font-size: 12.5px;
+}
+
+.sheet .legend-actions {
+  padding: 0 0 6px;
+}
+
+.sheet .legend-actions button {
+  height: 34px;
+  font-size: 12.5px;
+  border-radius: 9px;
+}
+
+.sheet-body.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 14px 18px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 46px;
+  padding: 0 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.row.static b {
+  color: #c9c9d2;
+  font-weight: 500;
+}
+
+.row.static b.warn {
+  color: #e3a06b;
+}
+
+.row input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  text-align: right;
+  font-size: 14px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.row select {
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.row .segmented {
+  padding: 2px;
+}
+
+.row .segmented button {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.hint {
+  margin: 4px 2px 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #6f6f7a;
+}
+
+.sheet-enter-active,
+.sheet-leave-active {
+  transition: transform 0.22s ease;
+}
+
+.sheet-enter-from,
+.sheet-leave-to {
+  transform: translateY(100%);
+}
+
+@media (max-width: 860px) {
+  .map-area {
+    touch-action: none;
+  }
 }
 </style>

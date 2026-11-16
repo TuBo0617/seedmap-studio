@@ -1,7 +1,9 @@
 name: build
 
 # Mirrors the platform matrix the upstream Axolotl Launcher ships:
-# Linux x64/arm64, Windows x64/arm64, macOS arm64/x64.
+# Linux x64/arm64, Windows x64/arm64, macOS arm64/x64, plus the mobile
+# targets: one universal Android APK covering all four ABIs and an
+# unsigned iOS build (signing needs an Apple developer certificate).
 on:
   workflow_dispatch:
   push:
@@ -97,3 +99,114 @@ jobs:
           if-no-files-found: error
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**
+
+  android:
+    name: android-universal
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # One Rust target per ABI, because the universal APK merges all four.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK and platform
+        run: |
+          sdkmanager --install "ndk;27.2.12479018" "platforms;android-36" "build-tools;36.0.0"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      # src-tauri/gen/android is checked in (it carries the MainActivity
+      # insets handling), so the project is not regenerated here.
+      - name: Build universal APK (arm64-v8a, armeabi-v7a, x86, x86_64)
+        run: pnpm tauri android build --apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-universal
+          if-no-files-found: error
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+  ios:
+    name: ios-unsigned
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ios
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Generate Xcode project
+        run: pnpm tauri ios init --ci
+
+      # No Apple certificate is available on CI, so the app is built
+      # unsigned and packed into an .ipa that can be re-signed locally with
+      # AltStore, Sideloadly or `codesign`.
+      - name: Build unsigned app
+        run: pnpm tauri ios build --target aarch64-apple-ios --release --no-sign
+
+      - name: Package unsigned ipa
+        run: |
+          APP=$(find src-tauri/gen/apple/build -maxdepth 4 -name "*.app" -type d | head -1)
+          echo "app bundle: $APP"
+          rm -rf Payload Seedmap-Studio-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Seedmap-Studio-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned
+          if-no-files-found: error
+          path: |
+            Seedmap-Studio-unsigned.ipa
+            src-tauri/gen/apple/build/**/*.app

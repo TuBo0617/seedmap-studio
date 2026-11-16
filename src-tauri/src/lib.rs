@@ -65,6 +65,7 @@ async fn seedmap_biome_at(
     .map_err(|error| error.to_string())
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
 

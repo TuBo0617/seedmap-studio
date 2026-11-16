@@ -3,10 +3,11 @@
 [![build](https://github.com/TuBo0617/seedmap-studio/actions/workflows/build.yml/badge.svg)](https://github.com/TuBo0617/seedmap-studio/actions/workflows/build.yml)
 [![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-把 Axolotl Launcher 里的「种子地图」实验室工具拆出来单独做的一个桌面应用：
+把 Axolotl Launcher 里的「种子地图」实验室工具拆出来单独做的一个应用：
 输入种子，按 Minecraft 版本和维度实时生成地形图，并标出村庄、要塞、远古城市等结构。
+桌面（Windows / macOS / Linux）与移动端（Android / iOS）共用同一套 RusT + cubiomes 引擎。
 
-界面用 Vue 3 + TypeScript，桌面壳是 Tauri 2，地形由 Rust 调用 cubiomes（C）生成。
+界面用 Vue 3 + TypeScript，壳层是 Tauri 2，地形由 Rust 调用 cubiomes（C）生成。
 
 安装包见 [Releases](https://github.com/TuBo0617/seedmap-studio/releases)。
 
@@ -37,7 +38,7 @@
 
 ## 平台支持
 
-与原 Axolotl 启动器一致，覆盖 6 个目标：
+桌面端与原 Axolotl 启动器一致，覆盖 6 个目标；移动端覆盖 4 个 Android ABI 和 iOS：
 
 | 平台 | 目标三元组 | 产物 | C 编译器 |
 |---|---|---|---|
@@ -47,6 +48,19 @@
 | macOS arm64 | `aarch64-apple-darwin` | `.dmg` | Apple clang |
 | macOS x64 | `x86_64-apple-darwin` | `.dmg` | Apple clang |
 | Linux x64 / arm64 | `*-unknown-linux-gnu` | `.deb` / `.rpm` / `.AppImage` | gcc / clang |
+| Android arm64 | `aarch64-linux-android` | `.apk`（arm64-v8a） | NDK clang 21+ |
+| Android arm | `armv7-linux-androideabi` | `.apk`（armeabi-v7a） | NDK clang 21+ |
+| Android x86 | `i686-linux-android` | `.apk`（x86） | NDK clang 21+ |
+| Android x86_64 | `x86_64-linux-android` | `.apk`（x86_64） | NDK clang 21+ |
+| iOS arm64 | `aarch64-apple-ios` | `.app` / 未签名 `.ipa` | Xcode clang |
+| iOS 模拟器 | `aarch64-apple-ios-sim`、`x86_64-apple-ios` | 模拟器 `.app` | Xcode clang |
+
+Android 默认产出**一个通用 APK，同时包含 4 个 ABI**，不需要为不同设备分包；`minSdk` 为 24（Android 7.0）。
+iOS 的部署目标写成 **13.0**，这是 Tauri 2 / WKWebView 的下限（`UIWindowScene` 从 iOS 13 才有），
+再往下没有可用的运行时支持。需要说明的是 Apple 从 Xcode 16 起只允许把部署目标设到 iOS 15
+（更低的档位会被 Xcode clamp 到 15），所以：**用 Xcode 15 构建 → 真正支持 iOS 13/14；
+用 Xcode 16/26 构建 → 实际最低 iOS 15**。CI 用的是 Xcode 26，产物属于后者；配置层面保持 13.0，
+换到 Xcode 15 就能直接出覆盖 iOS 13 的包。
 
 CI（`.github/workflows/build.yml`）按这张表跑矩阵，标签 push 时产出全部安装包。
 
@@ -99,6 +113,73 @@ cd src-tauri && cargo build --release --target x86_64-pc-windows-gnu
 
 产物在 `src-tauri/target/x86_64-pc-windows-gnu/release/seedmap-studio.exe`，
 运行需要同目录下有 WebView2 运行时（系统级安装即可，`downloadBootstrapper` 安装包会自动装）。
+
+### 移动端
+
+两端共用同一份前端与引擎，区别只在壳工程和 C 工具链。`build.rs` 会按目标自动挑选编译器：
+Android 用 NDK 里的 `<triple><api>-clang`，iOS 用 Xcode 的 clang 并带上
+`-mios-version-min=13.0`。
+
+**Android**（Linux / macOS / Windows 均可构建）
+
+```bash
+# 依赖：JDK 17+、Android SDK、NDK r27、四个 Rust target
+export ANDROID_HOME=$HOME/Android/Sdk
+export NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018
+rustup target add aarch64-linux-android armv7-linux-androideabi \
+                  i686-linux-android x86_64-linux-android
+
+pnpm install
+pnpm build
+pnpm tauri android init --ci       # 只需一次，生成 src-tauri/gen/android
+pnpm tauri android build --apk     # 通用 APK，一次打包四个 ABI
+```
+
+产物：`src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`。
+
+只想要某个架构（体积小一半以上）时加 `--target` 或直接分 ABI 打包：
+
+```bash
+pnpm tauri android build --apk --target armv7   # aarch64 / armv7 / i686 / x86_64
+pnpm tauri android build --apk --split-per-abi  # 四个独立 APK
+```
+
+签名：仓库里带了一个**开发用自签名证书**（`app/dev-keystore.jks`，密码 `seedmapstudio`），
+所以默认就能产出可安装的 APK，方便侧载测试。正式发布请换成自己的 key —— 在
+`src-tauri/gen/android/keystore.properties` 写入 `storeFile` / `storePassword` /
+`keyAlias` / `keyPassword`，Gradle 会优先使用它；这个文件已在 `.gitignore` 里。
+
+> 通用包同时含四个 ABI（约 37 MB）；分 ABI 后单个约 12–14 MB。Android 7.0（API 24）以下
+> 不支持，这是 Tauri 2 的下限。
+
+**iOS**（必须有 macOS + Xcode）
+
+```bash
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+pnpm install && pnpm build
+pnpm tauri ios init --ci
+pnpm tauri ios build --target aarch64-apple-ios --release
+```
+
+未签名产物可以用 `--no-sign` 生成（CI 就是这么做的），再用 AltStore、Sideloadly
+或 `codesign -f -s "Apple Development: ..."` 重签后安装。真机调试需要在
+`tauri.conf.json` 的 `bundle.iOS.developmentTeam` 填上 Team ID，或者直接用 Xcode
+打开 `src-tauri/gen/apple/seedmap_studio.xcodeproj` 选个人开发者账号。
+
+> Apple SDK 不能交叉编译，Linux / Windows 上无法产出 iOS 包；这也是 CI 把 iOS 单独
+> 放在 `macos-26` 上的原因。
+
+### 触屏操作
+
+| 手势 | 行为 |
+|---|---|
+| 单指拖动 | 平移地图 |
+| 双指捏合 | 连续缩放，松手吸附到 1:1 / 1:4 / 1:16 / 1:64 / 1:256 五档 |
+| 双击 | 以点击处为中心放大一档 |
+| 长按 | 探针：显示该点坐标与生物群系 |
+
+移动端布局与桌面不同：顶部只留种子输入和「生成」，版本 / 维度 / 图例收进底部浮动
+Dock 与上滑面板，缩放置于右侧竖排，全部避开刘海和手势条的安全区。
 
 
 ## 已实现

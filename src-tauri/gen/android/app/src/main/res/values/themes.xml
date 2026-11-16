@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.seedmap_studio" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Avoid a white splash frame before the WebView paints. -->
+        <item name="android:windowBackground">#141416</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>

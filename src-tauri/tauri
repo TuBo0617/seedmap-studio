@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+// The Android Gradle plugin shells out to `node tauri android android-studio-script`
+// with `src-tauri` as the working directory (see gen/android/buildSrc BuildTask),
+// so a package.json "bin" shim is not enough: Node resolves the argument as a
+// path relative to that directory. This file forwards to the real CLI.
+// The repository is `"type": "module"`, hence the dynamic import.
+import('../node_modules/@tauri-apps/cli/tauri.js')

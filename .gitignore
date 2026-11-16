@@ -4,3 +4,6 @@ target/
 *.log
 .DS_Store
 src-tauri/gen/schemas/
+
+# crash dumps from the Android build daemon
+core.*

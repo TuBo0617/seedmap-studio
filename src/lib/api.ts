@@ -75,3 +75,22 @@ export const findSpawn = (
   version: string,
 ): Promise<SpawnPoint> =>
   invoke<SpawnPoint>('seedmap_spawn', { seed, edition, version })
+
+export const biomeAt = (
+  seed: string,
+  edition: Edition,
+  version: string,
+  dimension: Dimension,
+  x: number,
+  y: number,
+  z: number,
+): Promise<number> =>
+  invoke<number>('seedmap_biome_at', {
+    seed,
+    edition,
+    version,
+    dimension,
+    x,
+    y,
+    z,
+  })
