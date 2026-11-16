@@ -219,7 +219,7 @@ jobs:
       # unsigned and packed into an .ipa that can be re-signed locally with
       # AltStore, Sideloadly or `codesign`.
       - name: Build unsigned app
-        run: pnpm tauri ios build --target aarch64-apple-ios --no-sign
+        run: pnpm tauri ios build --target aarch64 --no-sign
 
       - name: Collect unsigned ipa
         run: |
