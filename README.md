@@ -34,12 +34,12 @@
 .
 ├── crates/seedmap-core/        # 地形引擎（Rust + cubiomes）
 │   ├── src/
-│   │   ├── lib.rs              # 对外 API：render_tile / find_features / spawn / biome_at
+│   │   ├── lib.rs              # 对外 API：render_tile / find_features / spawn / biome_at / level.dat
 │   │   ├── bridge.rs           # 与 C 的 FFI
-│   │   ├── cubiomes_bridge.c   # 渲染、结构查找、出生点
+│   │   ├── cubiomes_bridge.c   # 渲染、结构查找（按类型分配配额）、出生点
 │   │   ├── cubiomes_details.c  # 结构细节
 │   │   ├── ores.rs             # 矿石候选
-│   │   ├── details.rs          # 战利品 / 结构详情
+│   │   ├── details.rs          # 战利品 / 结构详情 / 地下切片
 │   │   ├── underground.rs      # 地下体积
 │   │   └── assets/versions/    # 各版本结构布局数据（gzip JSON）
 │   ├── build.rs                # 用 cc 编译 cubiomes + 桥接层
