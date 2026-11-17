@@ -11,6 +11,7 @@ import {
   type StructureLoot,
 } from '../lib/api'
 import { FEATURE_BITS, featureMeta } from '../lib/features'
+import { structureIcon } from '../lib/icons'
 
 const props = defineProps<{
   feature: MapFeature
@@ -32,6 +33,7 @@ const canvas = ref<HTMLCanvasElement | null>(null)
 const showAllPieces = ref(false)
 
 const meta = computed(() => featureMeta(props.feature.kind))
+const icon = computed(() => structureIcon(props.feature.kind, props.feature.endShip))
 const mask = computed(() => FEATURE_BITS[props.feature.kind] ?? 0)
 
 const query = computed(() => ({
@@ -190,7 +192,10 @@ watch(
   <section class="panel">
     <header>
       <div class="title">
-        <i :style="{ background: meta.color }" />
+        <i class="badge">
+          <img v-if="icon" :src="icon" :alt="meta.label" />
+          <b v-else :style="{ background: meta.color }" />
+        </i>
         <b>{{ meta.label }}</b>
         <span>X {{ feature.x }} · Z {{ feature.z }}</span>
       </div>
@@ -304,9 +309,26 @@ header {
   min-width: 0;
 }
 
-.title i {
-  width: 9px;
-  height: 9px;
+.title i.badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.title i.badge img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
+
+.title i.badge b {
+  width: 10px;
+  height: 10px;
   border-radius: 3px;
 }
 

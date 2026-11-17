@@ -20,6 +20,14 @@ import { DEFAULT_KINDS, FEATURE_BITS, featureMeta, LEGEND_ORDER } from './lib/fe
 import { biomeName } from './lib/biomes'
 import { defaultOres, oreMeta, oresForDimension } from './lib/ores'
 import {
+  cachedImage,
+  preloadIcons,
+  setIconReadyHandler,
+  SPAWN_ICON,
+  structureIcon,
+  oreTileIcon,
+} from './lib/icons'
+import {
   clearHistory,
   loadHistory,
   recordHistory,
@@ -43,9 +51,18 @@ const features = ref<MapFeature[]>([])
 const activeKinds = ref<Set<string>>(new Set(DEFAULT_KINDS))
 const SCALES = [1, 4, 16, 64, 256]
 const TILE = 256
+/** 画布比视口大一圈，拖动时边缘不会立刻露出底色。 */
+const OVERSCAN = 1.55
+/** 瓦片位图缓存上限；滑动时几乎全部命中，不再反复向后端取图。 */
+const TILE_CACHE_LIMIT = 900
+/** 同时在算的瓦片数：太多会把内核全部占满，反而拖慢返回。 */
+const TILE_CONCURRENCY = 4
 const scale = ref(4)
 const center = reactive({ x: 0, z: 0 })
 const viewport = reactive({ w: 1280, h: 720 })
+/** 实际画布尺寸（视口 × OVERSCAN）。 */
+const render = reactive({ w: 1280, h: 720 })
+const spawnPoint = ref<{ x: number; z: number } | null>(null)
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const overlayRef = ref<HTMLCanvasElement | null>(null)
@@ -57,7 +74,6 @@ const lastMs = ref(0)
 const error = ref<string | null>(null)
 const showLegend = ref(true)
 const dragging = ref(false)
-const dragOffset = reactive({ x: 0, z: 0 })
 const hover = reactive({ x: 0, z: 0 })
 
 // --- 扩展图层：群系高亮 / 矿石 / 地下剖面 / 结构详情 / 历史 ---------------
@@ -88,19 +104,49 @@ const probe = ref<
   | null
 >(null)
 
-/** Live CSS transform applied while dragging or pinching. */
+/** 拖动/捏合期间只做 CSS 平移缩放，跨过预留边距时才重新取图对齐。 */
 const view = reactive({ tx: 0, tz: 0, zoom: 1, ox: 0, oy: 0 })
 const pinchActive = ref(false)
 
+/** 画布比视口大出来的那一圈就是可以“免费”拖动的距离。 */
+const dragLimit = computed(() => ({
+  x: Math.max(48, (render.w - viewport.w) / 2 - 48),
+  y: Math.max(48, (render.h - viewport.h) / 2 - 48),
+}))
+
 const stackStyle = computed(() => ({
+  left: `${-(render.w - viewport.w) / 2}px`,
+  top: `${-(render.h - viewport.h) / 2}px`,
+  width: `${render.w}px`,
+  height: `${render.h}px`,
   transform: `translate3d(${view.tx}px, ${view.tz}px, 0) scale(${view.zoom})`,
   transformOrigin: `${view.ox}px ${view.oy}px`,
 }))
 
 let media: MediaQueryList | null = null
-let renderSeq = 0
 let origin = { x: 0, z: 0, scale: 4, w: 1, h: 1 }
 let observer: ResizeObserver | null = null
+let featuresTimer: number | undefined
+let saveTimer: number | undefined
+let featureSeq = 0
+let busyTimer: number | undefined
+const tileCache = new Map<string, HTMLCanvasElement>()
+const tileInflight = new Set<string>()
+const tileQueue: TileJob[] = []
+const tileQueued = new Set<string>()
+let tileActive = 0
+/** 上一次完整画面，缩放时先铺上去当过渡，避免整屏黑等瓦片。 */
+let lastFrame: { canvas: HTMLCanvasElement; x: number; z: number; s: number; w: number; h: number } | null =
+  null
+
+interface TileJob {
+  key: string
+  wx: number
+  wz: number
+  s: number
+  highlight: string
+  dist: number
+}
 
 interface GestureState {
   mode: 'drag' | 'pinch'
@@ -184,6 +230,7 @@ const legendItems = computed(() => {
     kind,
     count: counts.get(kind) ?? 0,
     active: activeKinds.value.has(kind),
+    icon: structureIcon(kind),
     ...featureMeta(kind),
   }))
 })
@@ -193,12 +240,14 @@ function toggleKind(kind: string) {
   if (next.has(kind)) next.delete(kind)
   else next.add(kind)
   activeKinds.value = next
-  void loadFeatures(renderSeq)
+  drawMarkers()
+  void loadFeatures()
 }
 
 function selectAllKinds(on: boolean) {
   activeKinds.value = on ? new Set(LEGEND_ORDER) : new Set()
-  void loadFeatures(renderSeq)
+  drawMarkers()
+  void loadFeatures()
 }
 
 function openSide(next: SidePanel) {
@@ -211,7 +260,7 @@ function openSide(next: SidePanel) {
 
 function onBiomesChanged(list: number[]) {
   highlightBiomes.value = list
-  void repaint()
+  void repaint('reset')
 }
 
 const viewBounds = computed(() => {
@@ -447,14 +496,23 @@ function loadWorkspace(): Workspace | null {
   }
 }
 
-watch([seedValue, version, dimension, scale], saveWorkspace)
-watch(() => [center.x, center.z], saveWorkspace)
+/** 拖动时 center 每帧都在变，落盘必须防抖，否则每帧都要序列化一次 JSON。 */
+function scheduleSaveWorkspace() {
+  if (saveTimer !== undefined) window.clearTimeout(saveTimer)
+  saveTimer = window.setTimeout(() => {
+    saveTimer = undefined
+    saveWorkspace()
+  }, 700)
+}
+
+watch([seedValue, version, dimension, scale], scheduleSaveWorkspace)
+watch(() => [center.x, center.z], scheduleSaveWorkspace)
 
 watch(version, () => {
   if (!dimensions.value.includes(dimension.value)) {
     dimension.value = 'overworld'
   }
-  void repaint()
+  void repaint('reset')
 })
 
 watch(dimension, () => {
@@ -462,28 +520,39 @@ watch(dimension, () => {
   activeOres.value = activeOres.value.filter((kind) => allowed.has(kind))
   if (!activeOres.value.length) activeOres.value = [...defaultOres(dimension.value)]
   clearOres()
-  void repaint()
+  void repaint('reset')
 })
 
-function drawTile(
-  buffer: ArrayBuffer,
-  tw: number,
-  th: number,
-  dx: number,
-  dy: number,
-) {
-  const canvas = canvasRef.value
-  const ctx = canvas?.getContext('2d')
-  if (!canvas || !ctx) return
-  const image = new ImageData(new Uint8ClampedArray(buffer), tw, th)
+function cacheKey(x: number, z: number, s: number, highlight: string) {
+  return `${seedValue.value}|${version.value}|${dimension.value}|${s}|${x}|${z}|${highlight}`
+}
+
+function tileBitmap(buffer: ArrayBuffer, tw: number, th: number, key: string) {
   const off = document.createElement('canvas')
   off.width = tw
   off.height = th
-  off.getContext('2d')?.putImageData(image, 0, 0)
-  ctx.drawImage(off, dx, dy)
+  const ctx = off.getContext('2d')
+  if (ctx) {
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), tw, th), 0, 0)
+  }
+  if (tileCache.size >= TILE_CACHE_LIMIT) {
+    const oldest = tileCache.keys().next().value
+    if (oldest !== undefined) tileCache.delete(oldest)
+  }
+  tileCache.set(key, off)
+  return off
 }
 
-async function repaint() {
+/**
+ * 重绘整块画布。
+ *
+ * `hard` 用于种子/版本/维度切换这类内容完全失效的场景，只在这时才清屏；
+ * 平移和缩放保留上一帧像素，新瓦片逐块覆盖，避免拖动时反复闪黑。
+ */
+type PaintMode = 'none' | 'scale' | 'reset'
+
+function repaint(mode: PaintMode = 'none') {
+  const hard = mode !== 'none'
   const canvas = canvasRef.value
   if (!canvas) return
   const ctx = canvas.getContext('2d')
@@ -491,76 +560,199 @@ async function repaint() {
 
   const w = Math.max(240, Math.floor(viewport.w))
   const h = Math.max(200, Math.floor(viewport.h))
-  if (canvas.width !== w) canvas.width = w
-  if (canvas.height !== h) canvas.height = h
+  const rw = Math.max(w, Math.round(w * OVERSCAN))
+  const rh = Math.max(h, Math.round(h * OVERSCAN))
+  render.w = rw
+  render.h = rh
+
+  const resized = canvas.width !== rw || canvas.height !== rh
+  if (canvas.width !== rw) canvas.width = rw
+  if (canvas.height !== rh) canvas.height = rh
 
   const overlay = overlayRef.value
-  if (overlay && (overlay.width !== w || overlay.height !== h)) {
-    overlay.width = w
-    overlay.height = h
+  if (overlay && (overlay.width !== rw || overlay.height !== rh)) {
+    overlay.width = rw
+    overlay.height = rh
   }
 
-  const seq = ++renderSeq
   const s = scale.value
-  // 对齐到 scale 的整数倍，保证相邻瓦片严丝合缝
-  const left = Math.floor((center.x - (w / 2) * s) / s) * s
-  const top = Math.floor((center.z - (h / 2) * s) / s) * s
-  origin = { x: left, z: top, scale: s, w, h }
-
-  busy.value = true
-  error.value = null
-  ctx.fillStyle = '#0e0e10'
-  ctx.fillRect(0, 0, w, h)
+  // 先把当前画面连同它的世界坐标存下来，缩放后按比例摊开当过渡。
+  let snapshot: typeof lastFrame = null
+  if (mode === 'scale' && hasPainted.value && !resized) {
+    const snap = document.createElement('canvas')
+    snap.width = rw
+    snap.height = rh
+    snap.getContext('2d')?.drawImage(canvas, 0, 0)
+    lastFrame = { canvas: snap, x: origin.x, z: origin.z, s: origin.scale, w: origin.w, h: origin.h }
+    snapshot = lastFrame
+  }
+  // 左边界先对齐到 scale 的整数倍（像素不糊），瓦片再对齐到 TILE*scale，
+  // 这样平移一个像素不会让所有缓存失效，只有新露出的那一列/行要重新取图。
+  const left = Math.floor((center.x - (rw / 2) * s) / s) * s
+  const top = Math.floor((center.z - (rh / 2) * s) / s) * s
+  const step = TILE * s
+  const baseX = Math.floor(left / step) * step
+  const baseZ = Math.floor(top / step) * step
+  const dx0 = (baseX - left) / s
+  const dz0 = (baseZ - top) / s
+  origin = { x: left, z: top, scale: s, w: rw, h: rh }
 
   const started = performance.now()
-  const cols = Math.ceil(w / TILE)
-  const rows = Math.ceil(h / TILE)
-  let failure: string | null = null
+  const highlight = highlightBiomes.value.length ? highlightBiomes.value.join(',') : ''
 
-  const jobs: Promise<void>[] = []
-  for (let row = 0; row < rows; row += 1) {
-    for (let col = 0; col < cols; col += 1) {
-      const tw = Math.min(TILE, w - col * TILE)
-      const th = Math.min(TILE, h - row * TILE)
-      jobs.push(
-        renderTile({
-          seed: seedValue.value,
-          edition: 'java',
-          version: version.value,
-          dimension: dimension.value,
-          x: left + col * TILE * s,
-          z: top + row * TILE * s,
-          scale: s,
-          width: tw,
-          height: th,
-          elevation: 128,
-          terrain: false,
-          contours: false,
-          highlightBiomes: highlightBiomes.value.length ? highlightBiomes.value : null,
-        })
-          .then((buffer) => {
-            if (seq !== renderSeq) return
-            drawTile(buffer, tw, th, col * TILE, row * TILE)
-          })
-          .catch((reason) => {
-            failure = String(reason)
-          }),
-      )
+  if (hard || resized || !hasPainted.value) {
+    ctx.fillStyle = '#0e0e10'
+    ctx.fillRect(0, 0, rw, rh)
+    if (mode === 'reset') {
+      tileCache.clear()
+      lastFrame = null
     }
   }
 
-  await Promise.all(jobs)
-  if (seq !== renderSeq) return
+  if (mode === 'scale' && snapshot) {
+    const ratio = snapshot.s / s
+    ctx.imageSmoothingEnabled = true
+    ctx.drawImage(
+      snapshot.canvas,
+      (snapshot.x - left) / s,
+      (snapshot.z - top) / s,
+      snapshot.w * ratio,
+      snapshot.h * ratio,
+    )
+    ctx.imageSmoothingEnabled = false
+  }
 
-  busy.value = false
-  hasPainted.value = true
+  const cols = Math.ceil((left + rw * s - baseX) / step)
+  const rows = Math.ceil((top + rh * s - baseZ) / step)
+  const cx = left + (rw / 2) * s
+  const cz = top + (rh / 2) * s
+  const missing: TileJob[] = []
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const wx = baseX + col * step
+      const wz = baseZ + row * step
+      const key = cacheKey(wx, wz, s, highlight)
+      const cached = tileCache.get(key)
+      if (cached) {
+        ctx.drawImage(cached, dx0 + col * TILE, dz0 + row * TILE)
+        continue
+      }
+      missing.push({
+        key,
+        wx,
+        wz,
+        s,
+        highlight,
+        dist: Math.hypot(wx + step / 2 - cx, wz + step / 2 - cz),
+      })
+    }
+  }
+  const pending = missing.length
+  // 只保留当前视口还需要排队的活，远离视野的旧请求直接丢掉。
+  const keep = new Set(missing.map((job) => job.key))
+  for (let i = tileQueue.length - 1; i >= 0; i -= 1) {
+    const job = tileQueue[i]
+    if (!keep.has(job.key)) {
+      tileQueue.splice(i, 1)
+      tileQueued.delete(job.key)
+    }
+  }
+  // 中间的块先来，视觉上先成形。
+  missing.sort((a, b) => a.dist - b.dist)
+  for (const job of missing) {
+    if (tileQueued.has(job.key) || tileInflight.has(job.key)) continue
+    tileQueue.push(job)
+    tileQueued.add(job.key)
+  }
+  pumpTiles()
+
   lastMs.value = Math.round(performance.now() - started)
-  if (failure) error.value = failure
   drawMarkers()
-  void loadFeatures(seq)
+  scheduleFeatures()
+
+  if (pending === 0) {
+    hasPainted.value = true
+    busy.value = false
+    return
+  }
+  if (!hasPainted.value) {
+    // 首帧仍缺块：保留启动遮罩，等第一批瓦片回来再揭开。
+    busy.value = true
+    return
+  }
+  // 有缺块时延迟一点再显示“渲染中”，避免快速平移时状态栏闪烁。
+  if (busyTimer !== undefined) window.clearTimeout(busyTimer)
+  busyTimer = window.setTimeout(() => {
+    busyTimer = undefined
+    busy.value = tileActive > 0 || tileQueue.length > 0
+  }, 320)
 }
 
-async function loadFeatures(seq: number) {
+function pumpTiles() {
+  while (tileActive < TILE_CONCURRENCY && tileQueue.length) {
+    const job = tileQueue.shift()
+    if (!job) break
+    tileQueued.delete(job.key)
+    if (tileCache.has(job.key) || tileInflight.has(job.key)) continue
+    tileActive += 1
+    tileInflight.add(job.key)
+    renderTile({
+      seed: seedValue.value,
+      edition: 'java',
+      version: version.value,
+      dimension: dimension.value,
+      x: job.wx,
+      z: job.wz,
+      scale: job.s,
+      width: TILE,
+      height: TILE,
+      elevation: 128,
+      terrain: false,
+      contours: false,
+      highlightBiomes: job.highlight ? job.highlight.split(',').map(Number) : null,
+    })
+      .then((buffer) => {
+        const off = tileBitmap(buffer, TILE, TILE, job.key)
+        paintTile(job, off)
+      })
+      .catch((reason) => {
+        error.value = String(reason)
+      })
+      .finally(() => {
+        tileInflight.delete(job.key)
+        tileActive -= 1
+        if (tileActive === 0 && tileQueue.length === 0) {
+          busy.value = false
+          hasPainted.value = true
+        }
+        pumpTiles()
+      })
+  }
+}
+
+/** 瓦片到达时按当前视图落位，拖动/缩放进行中也能立刻补上。 */
+function paintTile(job: TileJob, off: HTMLCanvasElement) {
+  if (origin.scale !== job.s) return
+  const ctx = canvasRef.value?.getContext('2d')
+  if (!ctx) return
+  const dx = Math.round((job.wx - origin.x) / origin.scale)
+  const dy = Math.round((job.wz - origin.z) / origin.scale)
+  if (dx > origin.w || dy > origin.h || dx + TILE < 0 || dy + TILE < 0) return
+  ctx.drawImage(off, dx, dy)
+}
+
+/** 结构点查询比瓦片贵得多，等地图停下来再问后端。 */
+function scheduleFeatures(delay = 150) {
+  if (featuresTimer !== undefined) window.clearTimeout(featuresTimer)
+  featuresTimer = window.setTimeout(() => {
+    featuresTimer = undefined
+    void loadFeatures()
+  }, delay)
+}
+
+async function loadFeatures() {
+  const token = ++featureSeq
   const halfW = (origin.w / 2) * origin.scale
   const halfH = (origin.h / 2) * origin.scale
   try {
@@ -575,11 +767,13 @@ async function loadFeatures(seq: number) {
       maxZ: Math.round(center.z + halfH),
       featureMask: featureMask.value || null,
     })
-    if (seq !== renderSeq) return
+    if (token !== featureSeq) return
     features.value = list
     drawMarkers()
   } catch {
+    if (token !== featureSeq) return
     features.value = []
+    drawMarkers()
   }
 }
 
@@ -590,58 +784,101 @@ function drawMarkers() {
   if (!ctx) return
   ctx.clearRect(0, 0, overlay.width, overlay.height)
 
-  // At 1:64 a world-wide scan puts thousands of markers a few pixels apart,
-  // so markers shrink with the zoom and drop their outline once the view is
-  // crowded. Without this the map turns into a solid carpet of dots.
+  // 1:64 一次全图扫描会把上千个标记挤到几像素内，所以图标随缩放收缩、
+  // 过密时去掉阴影与描边，否则地图会糊成一整片彩色。
   const dense = features.value.length > 900
-  const r = dense
-    ? Math.max(2.4, Math.min(4, 7 / Math.sqrt(origin.scale)))
-    : Math.max(3.4, Math.min(8, 11 / Math.sqrt(origin.scale)))
+  const size = dense
+    ? Math.max(11, Math.min(20, 48 / Math.sqrt(origin.scale)))
+    : Math.max(14, Math.min(36, 72 / Math.sqrt(origin.scale)))
+  const half = size / 2
+
   for (const feature of features.value) {
     if (!activeKinds.value.has(feature.kind)) continue
     const px = (feature.x - origin.x) / origin.scale
     const pz = (feature.z - origin.z) / origin.scale
-    if (
-      px < -14 ||
-      pz < -14 ||
-      px > overlay.width + 14 ||
-      pz > overlay.height + 14
-    ) {
+    if (px < -size || pz < -size || px > overlay.width + size || pz > overlay.height + size) {
       continue
     }
     const meta = featureMeta(feature.kind)
-    ctx.beginPath()
-    ctx.arc(px, pz, r, 0, Math.PI * 2)
-    ctx.fillStyle = meta.color
-    ctx.fill()
-    if (!dense) {
-      ctx.lineWidth = 2
-      ctx.strokeStyle = 'rgba(12,12,14,0.85)'
-      ctx.stroke()
+    const icon = cachedImage(structureIcon(feature.kind, feature.endShip))
+    const selectedNow = selected.value === feature
+    if (icon) {
+      if (!dense) {
+        ctx.shadowColor = 'rgba(0,0,0,0.5)'
+        ctx.shadowBlur = 5
+        ctx.shadowOffsetY = 2
+      }
+      const box = selectedNow ? size + 4 : size
+      ctx.drawImage(icon, px - box / 2, pz - box / 2, box, box)
+      ctx.shadowColor = 'transparent'
+    } else {
+      ctx.beginPath()
+      ctx.arc(px, pz, half, 0, Math.PI * 2)
+      ctx.fillStyle = meta.color
+      ctx.fill()
+      if (!dense) {
+        ctx.lineWidth = 2
+        ctx.strokeStyle = 'rgba(12,12,14,0.85)'
+        ctx.stroke()
+      }
     }
   }
-  ctx.globalAlpha = 1
 
-  // Ore candidates are drawn as small squares so they stay distinguishable
-  // from the round structure markers at every zoom level.
-  const oreSize = Math.max(2, Math.min(4, 6 / Math.sqrt(origin.scale)))
+  if (spawnPoint.value) {
+    const point = spawnPoint.value
+    const px = (point.x - origin.x) / origin.scale
+    const pz = (point.z - origin.z) / origin.scale
+    if (px > -24 && pz > -24 && px < overlay.width + 24 && pz < overlay.height + 24) {
+      const icon = cachedImage(SPAWN_ICON)
+      const box = Math.max(16, Math.min(38, 84 / Math.sqrt(origin.scale)))
+      if (icon) {
+        ctx.shadowColor = 'rgba(0,0,0,0.5)'
+        ctx.shadowBlur = 5
+        ctx.shadowOffsetY = 2
+        ctx.drawImage(icon, px - box / 2, pz - box / 2, box, box)
+        ctx.shadowColor = 'transparent'
+      } else {
+        ctx.fillStyle = '#2e3138'
+        ctx.strokeStyle = '#ffffff'
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        ctx.arc(px, pz, box / 2, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.stroke()
+      }
+    }
+  }
+
+  // 矿石点用原版的 16×16 平铺纹理，和结构图标一眼就能区分开。
+  const oreSize = Math.max(3, Math.min(9, 14 / Math.sqrt(origin.scale)))
+  const deepslate = dimension.value !== 'nether'
   for (const hit of oreHits.value) {
     const px = (hit.x - origin.x) / origin.scale
     const pz = (hit.z - origin.z) / origin.scale
-    if (px < -4 || pz < -4 || px > overlay.width + 4 || pz > overlay.height + 4) {
+    if (px < -8 || pz < -8 || px > overlay.width + 8 || pz > overlay.height + 8) {
       continue
     }
-    ctx.fillStyle = oreMeta(hit.ore).color
-    ctx.fillRect(px - oreSize / 2, pz - oreSize / 2, oreSize, oreSize)
+    const icon = cachedImage(oreTileIcon(hit.ore, deepslate && hit.y < 0))
+    if (icon) {
+      ctx.imageSmoothingEnabled = false
+      ctx.drawImage(icon, px - oreSize / 2, pz - oreSize / 2, oreSize, oreSize)
+      ctx.imageSmoothingEnabled = true
+      ctx.strokeStyle = 'rgba(12,12,14,0.7)'
+      ctx.lineWidth = 1
+      ctx.strokeRect(px - oreSize / 2, pz - oreSize / 2, oreSize, oreSize)
+    } else {
+      ctx.fillStyle = oreMeta(hit.ore).color
+      ctx.fillRect(px - oreSize / 2, pz - oreSize / 2, oreSize, oreSize)
+    }
   }
 
   if (selected.value) {
     const px = (selected.value.x - origin.x) / origin.scale
     const pz = (selected.value.z - origin.z) / origin.scale
     ctx.beginPath()
-    ctx.arc(px, pz, r + 5, 0, Math.PI * 2)
+    ctx.arc(px, pz, half + 8, 0, Math.PI * 2)
     ctx.strokeStyle = '#ff77b9'
-    ctx.lineWidth = 2
+    ctx.lineWidth = 2.5
     ctx.stroke()
   }
 }
@@ -655,12 +892,24 @@ function applySeed() {
   void jumpToSpawn()
 }
 
+/** 出生点只是地图上的一个参考图标，失败不影响其它功能。 */
+async function loadSpawnMarker() {
+  try {
+    const spawn = await findSpawn(seedValue.value, 'java', version.value)
+    spawnPoint.value = { x: spawn.x, z: spawn.z }
+    drawMarkers()
+  } catch {
+    spawnPoint.value = null
+  }
+}
+
 async function jumpToSpawn() {
   try {
     const spawn = await findSpawn(seedValue.value, 'java', version.value)
     center.x = spawn.x
     center.z = spawn.z
-    await repaint()
+    spawnPoint.value = { x: spawn.x, z: spawn.z }
+    repaint('reset')
   } catch (reason) {
     error.value = String(reason)
   }
@@ -674,7 +923,7 @@ function stepScale(direction: 1 | -1) {
   )
   if (SCALES[next] === scale.value) return
   scale.value = SCALES[next]
-  void repaint()
+  void repaint('scale')
 }
 
 /** Changes the zoom level while keeping the world point under the cursor. */
@@ -690,7 +939,7 @@ function scaleAtPoint(next: number, clientX: number, clientY: number) {
   scale.value = next
   center.x = worldX - (mx - origin.w / 2) * next
   center.z = worldZ - (my - origin.h / 2) * next
-  void repaint()
+  void repaint('scale')
 }
 
 function nearestScale(value: number) {
@@ -705,7 +954,7 @@ function resetView() {
   scale.value = 4
   center.x = 0
   center.z = 0
-  void repaint()
+  void repaint('scale')
 }
 
 function onWheel(event: WheelEvent) {
@@ -720,6 +969,22 @@ function onWheel(event: WheelEvent) {
 }
 
 // --- pointer & touch handling --------------------------------------------
+
+/**
+ * 把 CSS 平移量吃进画布坐标系：位移基准前移、transform 归零、按新中心重绘。
+ * 三步在同一个任务里完成，浏览器只会合成最终状态，看不到中间跳动。
+ */
+function realignDrag() {
+  if (!gesture) return
+  // 基准整体前移：指针位置和世界中心都换成“此刻”的值，避免丢掉刚才的位移。
+  gesture.startX += view.tx
+  gesture.startY += view.tz
+  gesture.centerX = center.x
+  gesture.centerZ = center.z
+  view.tx = 0
+  view.tz = 0
+  repaint('scale')
+}
 
 function cancelLongPress() {
   if (longPressTimer !== undefined) {
@@ -801,6 +1066,12 @@ function onPointerDown(event: PointerEvent) {
     beginLongPress(event)
   } else if (pointers.size === 2) {
     cancelLongPress()
+    // 单指拖到一半再加第二指：先把平移吃进画布，捏合才从正确位置放大。
+    if (view.tx !== 0 || view.tz !== 0) {
+      view.tx = 0
+      view.tz = 0
+      repaint('scale')
+    }
     const [a, b] = [...pointers.values()]
     const rect = canvas.getBoundingClientRect()
     const focusClientX = (a.x + b.x) / 2
@@ -821,8 +1092,6 @@ function onPointerDown(event: PointerEvent) {
     }
     dragging.value = false
     pinchActive.value = true
-    view.tx = 0
-    view.tz = 0
     view.zoom = 1
     view.ox = gesture.focusX
     view.oy = gesture.focusY
@@ -851,16 +1120,17 @@ function onPointerMove(event: PointerEvent) {
       gesture.moved = true
       cancelLongPress()
     }
-    view.tx = dx
-    view.tz = dy
     center.x = gesture.centerX - dx * scale.value
     center.z = gesture.centerZ - dy * scale.value
-    hover.x = Math.round(
-      center.x + (event.clientX - canvas.getBoundingClientRect().left - origin.w / 2) * scale.value,
-    )
-    hover.z = Math.round(
-      center.z + (event.clientY - canvas.getBoundingClientRect().top - origin.h / 2) * scale.value,
-    )
+    view.tx = dx
+    view.tz = dy
+    const rect = canvas.getBoundingClientRect()
+    hover.x = Math.round(center.x + (event.clientX - rect.left - origin.w / 2) * scale.value)
+    hover.z = Math.round(center.z + (event.clientY - rect.top - origin.h / 2) * scale.value)
+    // 手指在预留边距内时只做合成层平移（不重绘）；越过边距再取一次图并归零。
+    if (Math.abs(dx) > dragLimit.value.x || Math.abs(dy) > dragLimit.value.y) {
+      realignDrag()
+    }
   }
 }
 
@@ -890,10 +1160,9 @@ function onPointerUp(event: PointerEvent) {
     const wasMobileTouch = event.pointerType !== 'mouse'
     gesture = null
     dragging.value = false
+    const shifted = view.tx !== 0 || view.tz !== 0
     view.tx = 0
     view.tz = 0
-    dragOffset.x = 0
-    dragOffset.z = 0
 
     if (!moved) {
       const now = performance.now()
@@ -918,7 +1187,7 @@ function onPointerUp(event: PointerEvent) {
         probe.value = null
       }
     }
-    void repaint()
+    void (shifted ? repaint('scale') : repaint())
   }
 }
 
@@ -930,8 +1199,6 @@ function onPointerCancel(event: PointerEvent) {
     dragging.value = false
     pinchActive.value = false
     view.zoom = 1
-    view.tx = 0
-    view.tz = 0
     void repaint()
   }
 }
@@ -963,6 +1230,10 @@ onMounted(async () => {
 
   history.value = loadHistory()
   activeOres.value = [...defaultOres('overworld')]
+
+  // 结构/矿石/群系图标来自原启动器素材，预热后 canvas 绘制是同步的。
+  preloadIcons()
+  setIconReadyHandler(() => drawMarkers())
 
   try {
     profiles.value = await fetchProfiles()
@@ -1017,7 +1288,7 @@ onMounted(async () => {
       if (!box) return
       viewport.w = box.width
       viewport.h = box.height
-      if (hasPainted.value && !dragging.value) void repaint()
+      if (hasPainted.value && !dragging.value) void repaint('scale')
     })
     observer.observe(mapWrap.value)
     viewport.w = mapWrap.value.clientWidth
@@ -1027,7 +1298,8 @@ onMounted(async () => {
   rememberSeed()
 
   if (resumed) {
-    await repaint()
+    repaint()
+    void loadSpawnMarker()
   } else {
     await jumpToSpawn()
   }
@@ -1037,6 +1309,13 @@ onBeforeUnmount(() => {
   observer?.disconnect()
   media?.removeEventListener('change', syncMobile)
   cancelLongPress()
+  setIconReadyHandler(null)
+  if (busyTimer !== undefined) window.clearTimeout(busyTimer)
+  if (featuresTimer !== undefined) window.clearTimeout(featuresTimer)
+  if (saveTimer !== undefined) {
+    window.clearTimeout(saveTimer)
+    saveWorkspace()
+  }
 })
 </script>
 
@@ -1259,7 +1538,10 @@ onBeforeUnmount(() => {
             :class="{ off: !item.active }"
             @click="toggleKind(item.kind)"
           >
-            <i :style="{ background: item.active ? item.color : '#4a4a52' }" />
+            <i class="legend-icon" :class="{ dim: !item.active }">
+              <img v-if="item.icon" :src="item.icon" :alt="item.label" />
+              <b v-else :style="{ background: item.active ? item.color : '#4a4a52' }" />
+            </i>
             <span>{{ item.label }}</span>
             <b v-if="item.active">{{ item.count }}</b>
           </div>
@@ -1335,7 +1617,10 @@ onBeforeUnmount(() => {
                 :class="{ off: !item.active }"
                 @click="toggleKind(item.kind)"
               >
-                <i :style="{ background: item.active ? item.color : '#4a4a52' }" />
+                <i class="legend-icon" :class="{ dim: !item.active }">
+                  <img v-if="item.icon" :src="item.icon" :alt="item.label" />
+                  <b v-else :style="{ background: item.active ? item.color : '#4a4a52' }" />
+                </i>
                 <span>{{ item.label }}</span>
                 <b v-if="item.active">{{ item.count }}</b>
               </div>
@@ -1677,7 +1962,8 @@ onBeforeUnmount(() => {
 
 .map-stack {
   position: absolute;
-  inset: 0;
+  left: 0;
+  top: 0;
   will-change: transform;
 }
 
@@ -1856,12 +2142,34 @@ canvas.overlay {
   background: rgba(255, 255, 255, 0.04);
 }
 
-.legend-list i {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+.legend-list i.legend-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
   flex: 0 0 auto;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.05);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+.legend-icon img {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  image-rendering: -webkit-optimize-contrast;
+}
+
+.legend-icon b {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.legend-icon.dim {
+  filter: grayscale(1);
+  opacity: 0.38;
 }
 
 .legend-list span {

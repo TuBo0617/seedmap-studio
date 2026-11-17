@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { BIOME_NAMES } from '../lib/biomes'
+import { biomeImage } from '../lib/icons'
 
 const props = defineProps<{
   biomes: number[]
@@ -19,7 +20,7 @@ const label = (id: number) => BIOME_NAMES[id] ?? `群系 ${id}`
 const items = computed(() => {
   const keyword = query.value.trim().toLowerCase()
   return props.biomes
-    .map((id) => ({ id, label: label(id) }))
+    .map((id) => ({ id, label: label(id), image: biomeImage(id) }))
     .filter((item) => !keyword || item.label.toLowerCase().includes(keyword))
 })
 
@@ -61,7 +62,9 @@ function setAll(on: boolean) {
         :class="{ on: selectedSet.has(item.id) }"
         @click="toggle(item.id)"
       >
-        <i :style="{ background: selectedSet.has(item.id) ? '#ff77b9' : '#3a3a43' }" />
+        <i class="thumb" :class="{ on: selectedSet.has(item.id) }">
+          <img v-if="item.image" :src="item.image" :alt="item.label" loading="lazy" />
+        </i>
         <span>{{ item.label }}</span>
         <em>{{ item.id }}</em>
       </button>
@@ -162,11 +165,25 @@ header b {
   background: var(--accent-soft);
 }
 
-.row i {
-  width: 9px;
-  height: 9px;
-  border-radius: 3px;
+.row i.thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
   flex: 0 0 auto;
+  overflow: hidden;
+  background: #2a2a31;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.row i.thumb.on {
+  box-shadow: 0 0 0 1.5px #ff77b9;
+}
+
+.row i.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .row span {

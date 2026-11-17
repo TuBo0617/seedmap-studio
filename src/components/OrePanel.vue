@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { Dimension, OreKind } from '../lib/api'
+import { oreItemIcon } from '../lib/icons'
 import { oresForDimension } from '../lib/ores'
 
 const props = defineProps<{
@@ -55,7 +56,15 @@ function reset() {
         :title="`Y ${ore.yMin} ~ ${ore.yMax}`"
         @click="toggle(ore.kind)"
       >
-        <i :style="{ background: activeSet.has(ore.kind) ? ore.color : '#3a3a43' }" />
+        <i class="cube" :class="{ on: activeSet.has(ore.kind) }">
+          <img
+            v-if="oreItemIcon(ore.kind)"
+            :src="oreItemIcon(ore.kind)"
+            :alt="ore.label"
+            loading="lazy"
+          />
+          <b v-else :style="{ background: ore.color }" />
+        </i>
         <span>{{ ore.label }}</span>
       </button>
     </div>
@@ -140,11 +149,44 @@ header b {
   background: var(--accent-soft);
 }
 
-.chip i {
-  width: 8px;
-  height: 8px;
-  border-radius: 3px;
+.chip i.cube {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.chip i.cube.on {
+  background: rgba(255, 119, 185, 0.14);
+  box-shadow: 0 0 0 1px rgba(255, 119, 185, 0.4);
+}
+
+.chip i.cube img {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  image-rendering: -webkit-optimize-contrast;
+}
+
+.chip i.cube b {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  opacity: 0.55;
+}
+
+.chip.on i.cube b {
+  opacity: 1;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.25);
+}
+
+.chip i.cube:not(.on) img {
+  filter: grayscale(0.35);
+  opacity: 0.75;
 }
 
 .chip span {
